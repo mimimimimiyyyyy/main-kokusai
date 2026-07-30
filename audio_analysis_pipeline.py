@@ -216,6 +216,43 @@ Return JSON with key 'analysis' containing a list of {{"phase": ..., "intent": .
     return tagged
 
 
+def extract_mask_targets_with_gpt(turns, block_size=40):
+    """
+    匿名化すべき単語（個人名・会社名・機密プロジェクト名・連絡先など）を
+    全発話を対象に抽出する。冒頭サンプルだけを見ると、会話後半にしか
+    登場しない固有名詞が見逃されるため、tag_turns_with_gptと同様に
+    全発話をブロックに分けてGPT-4oに走査させ、結果を統合する。
+    """
+    mask_words = {}
+    for i in range(0, len(turns), block_size):
+        block = turns[i: i + block_size]
+        block_data = json.dumps(
+            [{"speaker": t["speaker"], "text": t["text"]} for t in block],
+            ensure_ascii=False
+        )
+        mask_prompt = f"""
+Extract words or phrases that require anonymization (personal names, company
+names, confidential project names, phone numbers, email addresses, addresses,
+etc.) from the dialogue below. Do not flag common nouns or generic terms.
+
+Return JSON with key 'mask_list': a list of objects like {{"word": "..."}}.
+If nothing needs anonymization in this excerpt, return {{"mask_list": []}}.
+
+Data (utterances {i} to {i + len(block) - 1}):
+{block_data}
+        """
+        mask_res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": mask_prompt}],
+            response_format={"type": "json_object"}
+        )
+        for target in json.loads(mask_res.choices[0].message.content).get('mask_list', []):
+            word = target.get('word')
+            if word:
+                mask_words[word] = True
+    return [{"word": w} for w in mask_words]
+
+
 def render_analysis_charts(all_turns):
     df = pd.DataFrame(all_turns)
     df['duration'] = df['end'] - df['start']
@@ -287,13 +324,15 @@ def run_full_analysis(video_path):
     all_turns.sort(key=lambda x: x['start'])
 
     # C. メタデータ・要約判定
+    # summary/metadata/speaker_rolesは全体像の把握が目的なので冒頭サンプルで十分だが、
+    # 匿名化対象語の抽出は見逃しが個人情報漏洩に直結するため、ここでは含めない
+    # （全発話を対象に extract_mask_targets_with_gpt で別途行う）。
     print("AIによるメタデータ・要約・役割判定中...")
     all_speakers = sorted(list(set(t['speaker'] for t in all_turns)))
     prompt = f"""Extract the following from the dialogue data and return it in JSON.
     1. summary: Overall summary in English
     2. metadata: {{"scene": "Scene description in English", "task": "Task description in English"}}
     3. speaker_roles: {{"SPEAKER_ID": "Role in English"}} for all members. Never use Japanese or 'Unknown'. Example: {{"SPEAKER_00": "Leader"}}
-    4. mask_list: Words requiring anonymization and timestamps.
     Data (Sample): {json.dumps(all_turns[:30], ensure_ascii=False)}"""
 
     res = client.chat.completions.create(
@@ -315,8 +354,9 @@ def run_full_analysis(video_path):
         roles_dict[spk] = normalize_role(roles_dict.get(spk, "Participant"))
 
     # C-2. テキストデータの自動置換処理
+    print("匿名化対象語を全発話から抽出中...")
+    mask_list = extract_mask_targets_with_gpt(all_turns)
     print("文字起こしテキストの自動アノニマイズを実行中...")
-    mask_list = analysis_res.get('mask_list', [])
     for target in mask_list:
         secret_word = target.get('word')
         if secret_word:
