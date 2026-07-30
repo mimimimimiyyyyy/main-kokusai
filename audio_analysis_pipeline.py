@@ -385,13 +385,24 @@ async def api_search(req: SearchRequest):
     # 直近アップロード分だけのインメモリ状態ではなく、DBに永続化された
     # 全セッションのturnsを対象に検索する。過去に保存した分析結果を
     # セッション横断で再利用できるようにするための変更。
+    # 「直近アップロードした動画」= sessions.id が最大のセッションとして扱い、
+    # それ以外の全セッションと分けて返す。
+    latest = conn.execute(
+        "SELECT id, filename FROM sessions ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    latest_session_id, latest_filename = latest if latest else (None, None)
+
     rows = conn.execute(
         """SELECT t.session_id, s.filename, t.speaker, t.start, t.text, t.phase, t.role, t.embedding
            FROM turns t JOIN sessions s ON s.id = t.session_id
            WHERE t.embedding IS NOT NULL"""
     ).fetchall()
+    empty_response = {
+        "latest_session": {"session_id": latest_session_id, "filename": latest_filename, "results": []},
+        "past_sessions": {"results": []}
+    }
     if not rows:
-        return {"results": []}
+        return empty_response
 
     q_vec = np.array(
         client.embeddings.create(input=[req.query], model="text-embedding-3-small").data[0].embedding
@@ -399,11 +410,12 @@ async def api_search(req: SearchRequest):
     emb_matrix = np.stack([np.frombuffer(r[7], dtype=np.float64) for r in rows])
     scores = emb_matrix @ q_vec
 
-    results = []
+    latest_results = []
+    past_results = []
     for row, score in zip(rows, scores):
         if score >= 0.4:
             session_id, filename, speaker, start, text, phase, role, _ = row
-            results.append({
+            item = {
                 "session_id": session_id,
                 "filename": filename,
                 "time": f"{int(start//60):02d}:{int(start%60):02d}",
@@ -412,8 +424,18 @@ async def api_search(req: SearchRequest):
                 "text": text,
                 "phase": normalize_phase(phase),
                 "score": float(score)
-            })
-    return {"results": sorted(results, key=lambda x: x['score'], reverse=True)}
+            }
+            if session_id == latest_session_id:
+                latest_results.append(item)
+            else:
+                past_results.append(item)
+
+    latest_results.sort(key=lambda x: x['score'], reverse=True)
+    past_results.sort(key=lambda x: x['score'], reverse=True)
+    return {
+        "latest_session": {"session_id": latest_session_id, "filename": latest_filename, "results": latest_results},
+        "past_sessions": {"results": past_results}
+    }
 
 
 @app.get("/corpus")
