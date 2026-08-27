@@ -106,6 +106,24 @@ def init_db():
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         )
     """)
+    # human_annotations: GPT-4oの自動タグ付け（phase/intent）を検証するための人手ラベル。
+    # 発話(turn)ごとに、アノテーター単位で1件を保持する（同じturn×同じannotator_idは上書き）。
+    # 複数アノテーターの結果と、turns表にあるGPT-4oのラベルを突き合わせて評定者間一致率
+    # （Cohen's kappa等）を計算できるようにする。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS human_annotations (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id      INTEGER,
+            annotator_id TEXT,
+            phase        TEXT,
+            intent       TEXT,
+            confidence   INTEGER,
+            note         TEXT,
+            created      TEXT,
+            UNIQUE(turn_id, annotator_id),
+            FOREIGN KEY (turn_id) REFERENCES turns(id)
+        )
+    """)
     conn.commit()
     return conn
 
@@ -251,6 +269,50 @@ Data (utterances {i} to {i + len(block) - 1}):
             if word:
                 mask_words[word] = True
     return [{"word": w} for w in mask_words]
+
+
+def cohens_kappa(labels_a, labels_b):
+    """
+    2人の評定者（人手アノテーター同士、または人手 vs GPT-4o）が同じ発話につけた
+    ラベル列から、偶然の一致を差し引いたCohen's kappaを計算する。
+    labels_a/labels_bは同じ長さ・同じ順序（同一turnの並び）である前提。
+    """
+    n = len(labels_a)
+    if n == 0:
+        return None
+    po = sum(1 for a, b in zip(labels_a, labels_b) if a == b) / n
+    categories = set(labels_a) | set(labels_b)
+    pe = sum((labels_a.count(c) / n) * (labels_b.count(c) / n) for c in categories)
+    if pe >= 1:
+        return 1.0 if po == 1 else 0.0
+    return (po - pe) / (1 - pe)
+
+
+def rater_agreement(raters, rater_a, rater_b, label_index, label_type):
+    """
+    raters: {rater_id: {turn_id: (phase, intent)}} の形の辞書から、
+    rater_aとrater_bが両方ラベル付けしたturnだけを取り出して一致率を計算する。
+    label_index: phaseなら0、intentなら1。
+    """
+    shared_turns = [
+        tid for tid in raters[rater_a]
+        if tid in raters[rater_b]
+        and raters[rater_a][tid][label_index] is not None
+        and raters[rater_b][tid][label_index] is not None
+    ]
+    if not shared_turns:
+        return None
+    labels_a = [raters[rater_a][t][label_index] for t in shared_turns]
+    labels_b = [raters[rater_b][t][label_index] for t in shared_turns]
+    percent_agreement = sum(1 for x, y in zip(labels_a, labels_b) if x == y) / len(shared_turns)
+    return {
+        "rater_1": rater_a,
+        "rater_2": rater_b,
+        "label_type": label_type,
+        "n": len(shared_turns),
+        "percent_agreement": round(percent_agreement, 3),
+        "cohens_kappa": round(cohens_kappa(labels_a, labels_b), 3)
+    }
 
 
 def render_analysis_charts(all_turns):
@@ -410,6 +472,17 @@ class AddinRequest(BaseModel):
 
 class RetagRequest(BaseModel):
     method_version: Optional[str] = None
+
+class AnnotationItem(BaseModel):
+    turn_id: int
+    phase: Optional[str] = None
+    intent: Optional[str] = None
+    confidence: Optional[int] = None
+    note: Optional[str] = None
+
+class AnnotationRequest(BaseModel):
+    annotator_id: str
+    annotations: list[AnnotationItem]
 
 
 @app.post("/upload")
@@ -603,6 +676,118 @@ async def api_addin_save(session_id: int, req: AddinRequest):
     )
     conn.commit()
     return {"status": "saved", "session_id": session_id, "addin_name": req.addin_name, "method_version": version}
+
+
+@app.post("/corpus/{session_id}/annotations")
+async def api_add_annotations(session_id: int, req: AnnotationRequest):
+    # GPT-4oの自動タグ付けを検証するための人手ラベルを保存する。
+    # 同じturn×同じannotator_idで再送すると上書き（UNIQUE制約 + ON CONFLICT）される。
+    session = conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        return {"error": "Session not found"}
+
+    valid_turn_ids = {
+        row[0] for row in conn.execute(
+            "SELECT id FROM turns WHERE session_id=?", (session_id,)
+        ).fetchall()
+    }
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    saved = 0
+    skipped_turn_ids = []
+    for item in req.annotations:
+        if item.turn_id not in valid_turn_ids:
+            skipped_turn_ids.append(item.turn_id)
+            continue
+        conn.execute(
+            """INSERT INTO human_annotations
+               (turn_id, annotator_id, phase, intent, confidence, note, created)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(turn_id, annotator_id) DO UPDATE SET
+                   phase=excluded.phase, intent=excluded.intent,
+                   confidence=excluded.confidence, note=excluded.note, created=excluded.created""",
+            (
+                item.turn_id, req.annotator_id,
+                normalize_phase(item.phase) if item.phase else None,
+                normalize_intent(item.intent) if item.intent else None,
+                item.confidence, item.note, now
+            )
+        )
+        saved += 1
+    conn.commit()
+    return {
+        "status": "saved", "session_id": session_id, "annotator_id": req.annotator_id,
+        "saved": saved, "skipped_turn_ids": skipped_turn_ids
+    }
+
+
+@app.get("/corpus/{session_id}/annotations")
+async def api_get_annotations(session_id: int):
+    session = conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        return {"error": "Session not found"}
+    rows = conn.execute(
+        """SELECT ha.turn_id, ha.annotator_id, ha.phase, ha.intent, ha.confidence, ha.note, ha.created,
+                  t.speaker, t.start, t.text, t.phase, t.intent
+           FROM human_annotations ha
+           JOIN turns t ON t.id = ha.turn_id
+           WHERE t.session_id = ?
+           ORDER BY t.start, ha.annotator_id""",
+        (session_id,)
+    ).fetchall()
+    return {
+        "session_id": session_id,
+        "annotations": [
+            {
+                "turn_id": r[0], "annotator_id": r[1],
+                "human_phase": r[2], "human_intent": r[3],
+                "confidence": r[4], "note": r[5], "created": r[6],
+                "speaker": r[7], "start": r[8], "text": r[9],
+                "ai_phase": r[10], "ai_intent": r[11]
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/corpus/{session_id}/agreement")
+async def api_agreement(session_id: int):
+    # 人手アノテーター同士、および人手 vs GPT-4o の評定者間一致率（%一致 + Cohen's kappa）を
+    # phase/intentそれぞれについて算出する。両者がラベル付けした発話の共通部分だけを比較する。
+    session = conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        return {"error": "Session not found"}
+
+    raters = {}
+    ai_rows = conn.execute(
+        "SELECT id, phase, intent FROM turns WHERE session_id=?", (session_id,)
+    ).fetchall()
+    raters["GPT-4o"] = {r[0]: (r[1], r[2]) for r in ai_rows}
+
+    human_rows = conn.execute(
+        """SELECT ha.annotator_id, ha.turn_id, ha.phase, ha.intent
+           FROM human_annotations ha
+           JOIN turns t ON t.id = ha.turn_id
+           WHERE t.session_id = ?""",
+        (session_id,)
+    ).fetchall()
+    for annotator_id, turn_id, phase, intent in human_rows:
+        raters.setdefault(annotator_id, {})[turn_id] = (phase, intent)
+
+    rater_ids = list(raters.keys())
+    pairwise_agreement = []
+    for i in range(len(rater_ids)):
+        for j in range(i + 1, len(rater_ids)):
+            for label_index, label_type in [(0, "phase"), (1, "intent")]:
+                metric = rater_agreement(raters, rater_ids[i], rater_ids[j], label_index, label_type)
+                if metric:
+                    pairwise_agreement.append(metric)
+
+    return {
+        "session_id": session_id,
+        "raters": rater_ids,
+        "pairwise_agreement": pairwise_agreement
+    }
 
 
 # --- 5. サーバー起動 ---
