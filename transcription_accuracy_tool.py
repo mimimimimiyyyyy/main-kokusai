@@ -8,12 +8,19 @@ import difflib
 import sqlite3
 from datetime import datetime
 
+import numpy as np
+import openai
 import pandas as pd
 import matplotlib.pyplot as plt
 import japanize_matplotlib
+from google.colab import userdata
 
 DB_PATH = "/content/drive/MyDrive/corpus.db"
 SAVE_DIR = "/content/drive/MyDrive"
+
+# 意味的類似度（コサイン類似度）の算出用。CERは文字列としての一致度しか見ないため、
+# 「文字はだいぶ違うが意味はほぼ同じ」なケース（言い換え・フィラー違い等）を見分けるために使う。
+client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
 
 
 def get_connection():
@@ -65,6 +72,21 @@ def char_error_rate(reference, hypothesis):
     if not ref_chars:
         return None
     return edit_distance(ref_chars, hyp_chars) / len(ref_chars)
+
+
+def semantic_similarity(reference, hypothesis):
+    """
+    正解テキストとWhisperテキストの意味的な近さをコサイン類似度(0〜1、高いほど近い)で返す。
+    CERが高く出ていても、これが高ければ「文字は違うが言っている内容はほぼ同じ」と判断できる。
+    text-embedding-3-smallは出力ベクトルが正規化済みなので単純な内積で類似度になる
+    （run_full_analysis/searchの埋め込み計算と同じ考え方）。
+    """
+    if not reference.strip() or not hypothesis.strip():
+        return None
+    res = client.embeddings.create(input=[reference, hypothesis], model="text-embedding-3-small")
+    v1 = np.array(res.data[0].embedding)
+    v2 = np.array(res.data[1].embedding)
+    return float(np.dot(v1, v2))
 
 
 def text_diff(reference, hypothesis):
@@ -155,10 +177,11 @@ def get_transcription_accuracy(session_id: int):
 
     per_turn = []
     by_speaker = {}
-    total_wer, total_cer, total_n = 0.0, 0.0, 0
+    total_wer, total_cer, total_sim, total_n = 0.0, 0.0, 0.0, 0
     for turn_id, transcriber_id, reference_text, speaker, whisper_text in rows:
         wer = word_error_rate(reference_text, whisper_text)
         cer = char_error_rate(reference_text, whisper_text)
+        sim = semantic_similarity(reference_text, whisper_text)
         per_turn.append({
             "turn_id": turn_id,
             "speaker": speaker,
@@ -167,16 +190,19 @@ def get_transcription_accuracy(session_id: int):
             "reference_text": reference_text,
             "whisper_text": whisper_text,
             "wer": round(wer, 3) if wer is not None else None,
-            "cer": round(cer, 3) if cer is not None else None
+            "cer": round(cer, 3) if cer is not None else None,
+            "semantic_similarity": round(sim, 3) if sim is not None else None
         })
-        if wer is not None and cer is not None:
-            bucket = by_speaker.setdefault(speaker, {"n": 0, "wer_sum": 0.0, "cer_sum": 0.0})
+        if wer is not None and cer is not None and sim is not None:
+            bucket = by_speaker.setdefault(speaker, {"n": 0, "wer_sum": 0.0, "cer_sum": 0.0, "sim_sum": 0.0})
             bucket["n"] += 1
             bucket["wer_sum"] += wer
             bucket["cer_sum"] += cer
+            bucket["sim_sum"] += sim
             total_n += 1
             total_wer += wer
             total_cer += cer
+            total_sim += sim
 
     return {
         "session_id": session_id,
@@ -186,14 +212,16 @@ def get_transcription_accuracy(session_id: int):
                 "speaker": speaker,
                 "n_turns": b["n"],
                 "mean_wer": round(b["wer_sum"] / b["n"], 3),
-                "mean_cer": round(b["cer_sum"] / b["n"], 3)
+                "mean_cer": round(b["cer_sum"] / b["n"], 3),
+                "mean_semantic_similarity": round(b["sim_sum"] / b["n"], 3)
             }
             for speaker, b in by_speaker.items()
         ],
         "overall": {
             "n_turns": total_n,
             "mean_wer": round(total_wer / total_n, 3) if total_n else None,
-            "mean_cer": round(total_cer / total_n, 3) if total_n else None
+            "mean_cer": round(total_cer / total_n, 3) if total_n else None,
+            "mean_semantic_similarity": round(total_sim / total_n, 3) if total_n else None
         }
     }
 
@@ -203,11 +231,13 @@ def print_accuracy_report(session_id: int):
 
     overall = data["overall"]
     print(f"=== セッション{session_id} 文字起こし精度レポート ===")
-    print(f"全体: 発話数={overall['n_turns']}, 平均WER={overall['mean_wer']}, 平均CER={overall['mean_cer']}")
+    print(f"全体: 発話数={overall['n_turns']}, 平均WER={overall['mean_wer']}, 平均CER={overall['mean_cer']}, "
+          f"平均意味的類似度={overall['mean_semantic_similarity']}")
 
     print("\n話者別:")
     for row in data["by_speaker"]:
-        print(f"  {row['speaker']}: n={row['n_turns']}, 平均WER={row['mean_wer']}, 平均CER={row['mean_cer']}")
+        print(f"  {row['speaker']}: n={row['n_turns']}, 平均WER={row['mean_wer']}, 平均CER={row['mean_cer']}, "
+              f"平均意味的類似度={row['mean_semantic_similarity']}")
 
     masked = [t for t in data["per_turn"] if t["contains_mask"]]
     if masked:
@@ -271,6 +301,7 @@ def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15, save_dir
             "speaker": t["speaker"],
             "cer": t["cer"],
             "wer": t["wer"],
+            "semantic_similarity": t["semantic_similarity"],
             "below_threshold": t["is_significant"],
             "contains_mask": t["contains_mask"],
             "reference_text": t["reference_text"],
@@ -283,11 +314,16 @@ def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15, save_dir
     print(f"レポートを保存しました: {report_path}")
 
     # --- 一致率が低い発話の一覧を出力 ---
+    SIM_HIGH_THRESHOLD = 0.85  # これ以上なら「文字は違うが意味はほぼ同じ」とみなす目安
     significant = [t for t in turns_sorted if t["is_significant"]]
     print(f"\n=== 文字一致率が{1 - cer_threshold:.0%}未満の発話: {len(significant)}件 / 正解あり{len(turns_sorted)}件中 ===\n")
     for t in significant:
         mask_note = "　※匿名化([MASK])による差分の可能性あり" if t["contains_mask"] else ""
-        print(f"[turn_id={t['turn_id']}] 話者={t['speaker']}  CER={t['cer']}{mask_note}")
+        sim = t["semantic_similarity"]
+        sim_note = ""
+        if sim is not None and sim >= SIM_HIGH_THRESHOLD:
+            sim_note = "　※意味的には近い可能性あり（言い換え等）"
+        print(f"[turn_id={t['turn_id']}] 話者={t['speaker']}  CER={t['cer']}  意味的類似度={sim}{mask_note}{sim_note}")
         print(f"  正解    : {t['reference_text']}")
         print(f"  Whisper : {t['whisper_text']}")
         for d in t["diffs"]:
