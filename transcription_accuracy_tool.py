@@ -7,10 +7,12 @@
 
 import difflib
 import requests
+import pandas as pd
 import matplotlib.pyplot as plt
 import japanize_matplotlib
 
 BASE_URL = "https://xxxx-xx-xx-xx-xx.ngrok-free.app"  # ← サーバー起動時に表示されたURLに置き換える
+SAVE_DIR = "/content/drive/MyDrive"  # ← チャート・レポートの保存先（corpus.dbと同じDrive）
 
 
 def get_raw_turns(session_id: int):
@@ -79,11 +81,12 @@ def text_diff(reference, hypothesis):
     return diffs
 
 
-def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15):
+def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15, save_dir: str = SAVE_DIR):
     """
     正解テキスト(reference_text) と Whisper出力(turns.text) の文字一致率(1-CER)を
     発話ごとに可視化し、CERが閾値を超える（＝文字の一致率が低い）発話だけを
     差分付きで一覧表示する。
+    グラフ（PNG）と発話ごとの結果（CSV）はsave_dir配下にファイルとして保存する。
     """
     data = get_transcription_accuracy(session_id)
     per_turn = data["per_turn"]
@@ -117,7 +120,30 @@ def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15):
     ]
     ax.legend(handles=legend_handles, loc="lower right")
     plt.tight_layout()
+
+    chart_path = f"{save_dir}/session_{session_id}_accuracy_chart.png"
+    plt.savefig(chart_path, dpi=150, bbox_inches="tight")
     plt.show()
+    print(f"チャートを保存しました: {chart_path}")
+
+    # --- 発話ごとの結果をCSVとして保存 ---
+    report_path = f"{save_dir}/session_{session_id}_accuracy_report.csv"
+    report_df = pd.DataFrame([
+        {
+            "turn_id": t["turn_id"],
+            "speaker": t["speaker"],
+            "cer": t["cer"],
+            "wer": t["wer"],
+            "below_threshold": t["is_significant"],
+            "contains_mask": t["contains_mask"],
+            "reference_text": t["reference_text"],
+            "whisper_text": t["whisper_text"],
+            "diff": " / ".join(f"{d['type']}:「{d['reference']}」→「{d['whisper']}」" for d in t["diffs"])
+        }
+        for t in turns_sorted
+    ])
+    report_df.to_csv(report_path, index=False, encoding="utf-8-sig")
+    print(f"レポートを保存しました: {report_path}")
 
     # --- 一致率が低い発話の一覧を出力 ---
     significant = [t for t in turns_sorted if t["is_significant"]]
