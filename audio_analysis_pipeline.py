@@ -124,6 +124,20 @@ def init_db():
             FOREIGN KEY (turn_id) REFERENCES turns(id)
         )
     """)
+    # reference_transcripts: Whisperの文字起こし精度を検証するための人手の正解テキスト。
+    # turns.textはWhisperの出力（かつ匿名化済み）なので、それとは別にturn単位で
+    # 「実際に何と言ったか」を書き起こしたテキストを保持し、WER/CERの算出に使う。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reference_transcripts (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id        INTEGER,
+            transcriber_id TEXT,
+            reference_text TEXT,
+            created        TEXT,
+            UNIQUE(turn_id, transcriber_id),
+            FOREIGN KEY (turn_id) REFERENCES turns(id)
+        )
+    """)
     conn.commit()
     return conn
 
@@ -315,6 +329,50 @@ def rater_agreement(raters, rater_a, rater_b, label_index, label_type):
     }
 
 
+def edit_distance(ref_tokens, hyp_tokens):
+    """
+    参照トークン列(ref_tokens)と仮説トークン列(hyp_tokens)の間の編集距離
+    （挿入・削除・置換の最小回数）を計算する。word_error_rate/char_error_rateの土台。
+    """
+    n, m = len(ref_tokens), len(hyp_tokens)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if ref_tokens[i - 1] == hyp_tokens[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+    return dp[n][m]
+
+
+def word_error_rate(reference, hypothesis):
+    """
+    英語のような分かち書き言語向け。空白区切りの単語列で編集距離を取り、
+    参照テキストの単語数で割る（標準的なWER定義）。
+    """
+    ref_tokens = reference.split()
+    hyp_tokens = hypothesis.split()
+    if not ref_tokens:
+        return None
+    return edit_distance(ref_tokens, hyp_tokens) / len(ref_tokens)
+
+
+def char_error_rate(reference, hypothesis):
+    """
+    日本語のように分かち書きされない言語向け。文字単位で編集距離を取る（CER）。
+    英語・日本語が混在する多国籍グループの発話でも言語を判別せず一律に使える。
+    """
+    ref_chars = list(reference.replace(" ", ""))
+    hyp_chars = list(hypothesis.replace(" ", ""))
+    if not ref_chars:
+        return None
+    return edit_distance(ref_chars, hyp_chars) / len(ref_chars)
+
+
 def render_analysis_charts(all_turns):
     df = pd.DataFrame(all_turns)
     df['duration'] = df['end'] - df['start']
@@ -483,6 +541,14 @@ class AnnotationItem(BaseModel):
 class AnnotationRequest(BaseModel):
     annotator_id: str
     annotations: list[AnnotationItem]
+
+class ReferenceTranscriptItem(BaseModel):
+    turn_id: int
+    reference_text: str
+
+class ReferenceTranscriptRequest(BaseModel):
+    transcriber_id: str
+    transcripts: list[ReferenceTranscriptItem]
 
 
 @app.post("/upload")
@@ -787,6 +853,107 @@ async def api_agreement(session_id: int):
         "session_id": session_id,
         "raters": rater_ids,
         "pairwise_agreement": pairwise_agreement
+    }
+
+
+@app.post("/corpus/{session_id}/reference_transcripts")
+async def api_add_reference_transcripts(session_id: int, req: ReferenceTranscriptRequest):
+    # Whisperの文字起こし精度を検証するため、人手で書き起こした正解テキストを
+    # turn単位で保存する。同じturn×同じtranscriber_idで再送すると上書きされる。
+    session = conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        return {"error": "Session not found"}
+
+    valid_turn_ids = {
+        row[0] for row in conn.execute(
+            "SELECT id FROM turns WHERE session_id=?", (session_id,)
+        ).fetchall()
+    }
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    saved = 0
+    skipped_turn_ids = []
+    for item in req.transcripts:
+        if item.turn_id not in valid_turn_ids:
+            skipped_turn_ids.append(item.turn_id)
+            continue
+        conn.execute(
+            """INSERT INTO reference_transcripts (turn_id, transcriber_id, reference_text, created)
+               VALUES (?,?,?,?)
+               ON CONFLICT(turn_id, transcriber_id) DO UPDATE SET
+                   reference_text=excluded.reference_text, created=excluded.created""",
+            (item.turn_id, req.transcriber_id, item.reference_text, now)
+        )
+        saved += 1
+    conn.commit()
+    return {
+        "status": "saved", "session_id": session_id, "transcriber_id": req.transcriber_id,
+        "saved": saved, "skipped_turn_ids": skipped_turn_ids
+    }
+
+
+@app.get("/corpus/{session_id}/transcription_accuracy")
+async def api_transcription_accuracy(session_id: int):
+    # 人手の正解テキスト(reference_transcripts) vs Whisperの出力(turns.text)で
+    # WER(単語誤り率)とCER(文字誤り率)を計算し、話者ごとに集計する。
+    # turns.textは匿名化(C-2.)済みなので、[MASK]を含む発話は誤差が乗ることに注意し、
+    # per_turnにcontains_maskを付けてフィルタできるようにしている。
+    session = conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        return {"error": "Session not found"}
+
+    rows = conn.execute(
+        """SELECT rt.turn_id, rt.transcriber_id, rt.reference_text,
+                  t.speaker, t.text
+           FROM reference_transcripts rt
+           JOIN turns t ON t.id = rt.turn_id
+           WHERE t.session_id = ?
+           ORDER BY t.start""",
+        (session_id,)
+    ).fetchall()
+
+    per_turn = []
+    by_speaker = {}
+    total_wer, total_cer, total_n = 0.0, 0.0, 0
+    for turn_id, transcriber_id, reference_text, speaker, whisper_text in rows:
+        wer = word_error_rate(reference_text, whisper_text)
+        cer = char_error_rate(reference_text, whisper_text)
+        per_turn.append({
+            "turn_id": turn_id,
+            "speaker": speaker,
+            "transcriber_id": transcriber_id,
+            "contains_mask": "[MASK]" in whisper_text,
+            "reference_text": reference_text,
+            "whisper_text": whisper_text,
+            "wer": round(wer, 3) if wer is not None else None,
+            "cer": round(cer, 3) if cer is not None else None
+        })
+        if wer is not None and cer is not None:
+            bucket = by_speaker.setdefault(speaker, {"n": 0, "wer_sum": 0.0, "cer_sum": 0.0})
+            bucket["n"] += 1
+            bucket["wer_sum"] += wer
+            bucket["cer_sum"] += cer
+            total_n += 1
+            total_wer += wer
+            total_cer += cer
+
+    return {
+        "session_id": session_id,
+        "per_turn": per_turn,
+        "by_speaker": [
+            {
+                "speaker": speaker,
+                "n_turns": b["n"],
+                "mean_wer": round(b["wer_sum"] / b["n"], 3),
+                "mean_cer": round(b["cer_sum"] / b["n"], 3)
+            }
+            for speaker, b in by_speaker.items()
+        ],
+        "overall": {
+            "n_turns": total_n,
+            "mean_wer": round(total_wer / total_n, 3) if total_n else None,
+            "mean_cer": round(total_cer / total_n, 3) if total_n else None
+        }
     }
 
 
