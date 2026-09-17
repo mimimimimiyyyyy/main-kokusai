@@ -12,28 +12,6 @@ import japanize_matplotlib
 
 BASE_URL = "https://xxxx-xx-xx-xx-xx.ngrok-free.app"  # ← サーバー起動時に表示されたURLに置き換える
 
-# 意図ラベリング（Proposal/Question/Agreement/Disagreement/Confirmation/Acknowledge/Explanation）
-# の判定を左右しそうなキーワード。ここに単語が含まれる差分は「意味が変わりうる」とみなす。
-# あくまでヒューリスティック（機械的なキーワード一致）であり、意味的に完全な判定ではない点に注意。
-INTENT_CRITICAL_WORDS = {
-    "否定(negation)": [
-        "not", "n't", "never", "no", "don't", "isn't", "wasn't", "can't", "won't", "doesn't",
-        "ない", "ません", "拒否", "無理", "だめ"
-    ],
-    "同意(agreement)": [
-        "agree", "ok", "okay", "sure", "yes", "fine", "sounds good",
-        "同意", "賛成", "いいですね", "そうですね", "オッケー", "はい"
-    ],
-    "反対(disagreement)": [
-        "disagree", "but", "however", "actually", "not sure",
-        "反対", "違う", "でも", "しかし", "微妙"
-    ],
-    "疑問(question)": [
-        "what", "why", "how", "could you", "would you", "?",
-        "か？", "ですか", "でしょうか", "なぜ", "どう", "？"
-    ],
-}
-
 
 def get_raw_turns(session_id: int):
     """正解テキストを付けたいセッションの発話一覧（turn_id/speaker/text）を確認する。"""
@@ -101,30 +79,11 @@ def text_diff(reference, hypothesis):
     return diffs
 
 
-def find_intent_critical_categories(reference, whisper):
-    """
-    正解テキストとWhisperテキストそれぞれについて、意図ラベリングに関わる
-    キーワードカテゴリの出現有無を調べ、両者で結果が異なるカテゴリ
-    （＝誤りによってキーワードが消えた/現れた）を返す。
-    diffの文字断片同士を突き合わせるのではなく全文で判定することで、
-    「違う」のようなキーワードが1文字だけの差分に分断されて検出漏れするのを防ぐ。
-    """
-    ref_lower = reference.lower()
-    hyp_lower = whisper.lower()
-    changed_categories = set()
-    for category, words in INTENT_CRITICAL_WORDS.items():
-        ref_hit = any(w.lower() in ref_lower for w in words)
-        hyp_hit = any(w.lower() in hyp_lower for w in words)
-        if ref_hit != hyp_hit:
-            changed_categories.add(category)
-    return changed_categories
-
-
 def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15):
     """
-    正解テキスト(reference_text) と Whisper出力(turns.text) の一致率を発話ごとに可視化し、
-    「大きな違い」（CERが閾値を超える、または意図ラベリングに影響しそうなキーワードが
-    変化した）発話だけを一覧表示する。
+    正解テキスト(reference_text) と Whisper出力(turns.text) の文字一致率(1-CER)を
+    発話ごとに可視化し、CERが閾値を超える（＝文字の一致率が低い）発話だけを
+    差分付きで一覧表示する。
     """
     data = get_transcription_accuracy(session_id)
     per_turn = data["per_turn"]
@@ -134,53 +93,38 @@ def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15):
 
     for t in per_turn:
         t["diffs"] = text_diff(t["reference_text"], t["whisper_text"])
-        t["hit_categories"] = find_intent_critical_categories(t["reference_text"], t["whisper_text"])
-        # 「大きな違い」= 誤り率が閾値を超える、または意図に関わるキーワードが変化した場合
-        t["is_significant"] = bool(t["diffs"]) and (
-            (t["cer"] is not None and t["cer"] >= cer_threshold) or len(t["hit_categories"]) > 0
-        )
+        t["is_significant"] = t["cer"] is not None and t["cer"] >= cer_threshold
 
-    # --- 可視化: 発話ごとの一致率（1-CER）。赤=意図に影響しうる重大な差分、
-    #     オレンジ=軽微な差分、緑=完全一致 で色分けする ---
+    # --- 可視化: 発話ごとの文字一致率（1-CER）。赤=閾値超過、緑=閾値内 で色分けする ---
     turns_sorted = sorted(per_turn, key=lambda t: t["turn_id"])
     x = list(range(len(turns_sorted)))
     accuracy = [1 - t["cer"] if t["cer"] is not None else 0 for t in turns_sorted]
 
-    COLOR_SIGNIFICANT = "#d62728"
-    COLOR_MINOR = "#ff9f40"
-    COLOR_EXACT = "#2ca02c"
-    colors = []
-    for t in turns_sorted:
-        if t["is_significant"]:
-            colors.append(COLOR_SIGNIFICANT)
-        elif t["cer"] and t["cer"] > 0:
-            colors.append(COLOR_MINOR)
-        else:
-            colors.append(COLOR_EXACT)
+    COLOR_LOW = "#d62728"
+    COLOR_OK = "#2ca02c"
+    colors = [COLOR_LOW if t["is_significant"] else COLOR_OK for t in turns_sorted]
 
     fig, ax = plt.subplots(figsize=(max(8, len(x) * 0.35), 5))
     ax.bar(x, accuracy, color=colors)
     ax.set_xlabel("発話順（turn）")
-    ax.set_ylabel("一致率 (1 - CER)")
+    ax.set_ylabel("文字一致率 (1 - CER)")
     ax.set_ylim(0, 1.05)
-    ax.set_title(f"セッション{session_id}: 正解テキストとWhisper出力の一致率")
+    ax.set_title(f"セッション{session_id}: 正解テキストとWhisper出力の文字一致率")
     ax.axhline(1 - cer_threshold, color="gray", linestyle="--", linewidth=1)
     legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color=COLOR_EXACT, label="完全一致"),
-        plt.Rectangle((0, 0), 1, 1, color=COLOR_MINOR, label="軽微な差分"),
-        plt.Rectangle((0, 0), 1, 1, color=COLOR_SIGNIFICANT, label="意図に影響しうる重大な差分"),
+        plt.Rectangle((0, 0), 1, 1, color=COLOR_OK, label=f"一致率 ≥ {1 - cer_threshold:.0%}"),
+        plt.Rectangle((0, 0), 1, 1, color=COLOR_LOW, label=f"一致率 < {1 - cer_threshold:.0%}"),
     ]
     ax.legend(handles=legend_handles, loc="lower right")
     plt.tight_layout()
     plt.show()
 
-    # --- 重大な差分の一覧を出力 ---
+    # --- 一致率が低い発話の一覧を出力 ---
     significant = [t for t in turns_sorted if t["is_significant"]]
-    print(f"\n=== 意図ラベリングに影響しうる重大な差分: {len(significant)}件 / 正解あり{len(turns_sorted)}件中 ===\n")
+    print(f"\n=== 文字一致率が{1 - cer_threshold:.0%}未満の発話: {len(significant)}件 / 正解あり{len(turns_sorted)}件中 ===\n")
     for t in significant:
         mask_note = "　※匿名化([MASK])による差分の可能性あり" if t["contains_mask"] else ""
-        reason = sorted(t["hit_categories"]) if t["hit_categories"] else [f"CER閾値({cer_threshold})超過"]
-        print(f"[turn_id={t['turn_id']}] 話者={t['speaker']}  CER={t['cer']}  理由={reason}{mask_note}")
+        print(f"[turn_id={t['turn_id']}] 話者={t['speaker']}  CER={t['cer']}{mask_note}")
         print(f"  正解    : {t['reference_text']}")
         print(f"  Whisper : {t['whisper_text']}")
         for d in t["diffs"]:
@@ -208,5 +152,5 @@ def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15):
 # 3. 話者別のWER/CERレポートを表示する
 # print_accuracy_report(session_id=1)
 
-# 4. 一致率を可視化し、意図ラベリングに影響しうる大きな差分だけを抽出する
+# 4. 文字一致率を可視化し、一致率が低い発話だけを差分付きで一覧表示する
 # analyze_and_visualize(session_id=1, cer_threshold=0.15)
