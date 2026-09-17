@@ -1,45 +1,201 @@
-# --- 別セル: 文字起こし精度（WER/CER）測定ツール ---
-# 前提: audio_analysis_pipeline.py のサーバーが同じColab上で起動していること。
-# サーバー起動セルの出力に表示された public_url を、下のBASE_URLに貼り付けてから実行する。
-# ロジック（正解テキストの保存・WER/CER計算）はサーバー側の
-# POST /corpus/{id}/reference_transcripts と GET /corpus/{id}/transcription_accuracy
-# をそのまま呼び出しているだけなので、計算処理を二重実装していない。
+# --- 別セル: 文字起こし精度（WER/CER）測定ツール（DB直接アクセス版） ---
+# audio_analysis_pipeline.py のサーバーを起動していなくても、Google Driveがマウントされて
+# いればこのセル単体で動く。ngrokのURLは不要（corpus.dbに直接読み書きする）。
+# WER/CER計算ロジックはサーバー側（audio_analysis_pipeline.py）と同じものをここに
+# 複製している。ロジックを変更した場合は両方に反映すること。
 
 import difflib
-import requests
+import sqlite3
+from datetime import datetime
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import japanize_matplotlib
 
-BASE_URL = "https://xxxx-xx-xx-xx-xx.ngrok-free.app"  # ← サーバー起動時に表示されたURLに置き換える
-SAVE_DIR = "/content/drive/MyDrive"  # ← チャート・レポートの保存先（corpus.dbと同じDrive）
+DB_PATH = "/content/drive/MyDrive/corpus.db"
+SAVE_DIR = "/content/drive/MyDrive"
+
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    # サーバーを一度も起動していない状態でこのセルだけ使う場合に備えてテーブルを保証する
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reference_transcripts (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id        INTEGER,
+            transcriber_id TEXT,
+            reference_text TEXT,
+            created        TEXT,
+            UNIQUE(turn_id, transcriber_id),
+            FOREIGN KEY (turn_id) REFERENCES turns(id)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def edit_distance(ref_tokens, hyp_tokens):
+    n, m = len(ref_tokens), len(hyp_tokens)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if ref_tokens[i - 1] == hyp_tokens[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+    return dp[n][m]
+
+
+def word_error_rate(reference, hypothesis):
+    ref_tokens = reference.split()
+    hyp_tokens = hypothesis.split()
+    if not ref_tokens:
+        return None
+    return edit_distance(ref_tokens, hyp_tokens) / len(ref_tokens)
+
+
+def char_error_rate(reference, hypothesis):
+    ref_chars = list(reference.replace(" ", ""))
+    hyp_chars = list(hypothesis.replace(" ", ""))
+    if not ref_chars:
+        return None
+    return edit_distance(ref_chars, hyp_chars) / len(ref_chars)
+
+
+def text_diff(reference, hypothesis):
+    """
+    正解テキストとWhisperテキストを文字単位で比較し、一致していない箇所
+    （置換・削除・追加）のリストを返す。分かち書きしない日本語にも対応するため
+    単語区切りではなく文字単位で差分を取る。
+    """
+    matcher = difflib.SequenceMatcher(None, reference, hypothesis)
+    diffs = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        diffs.append({
+            "type": tag,  # replace / delete / insert
+            "reference": reference[i1:i2],
+            "whisper": hypothesis[j1:j2],
+        })
+    return diffs
 
 
 def get_raw_turns(session_id: int):
     """正解テキストを付けたいセッションの発話一覧（turn_id/speaker/text）を確認する。"""
-    res = requests.get(f"{BASE_URL}/corpus/{session_id}/raw_turns")
-    res.raise_for_status()
-    return res.json()
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, speaker, start, end, text FROM turns WHERE session_id=? ORDER BY start",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+    return {
+        "session_id": session_id,
+        "turns": [
+            {"turn_id": r[0], "speaker": r[1], "start": r[2], "end": r[3], "text": r[4]}
+            for r in rows
+        ]
+    }
 
 
 def submit_reference_transcripts(session_id: int, transcriber_id: str, transcripts: list):
     """
-    人手で書き起こした正解テキストをサーバーに保存する。
+    人手で書き起こした正解テキストをcorpus.dbに保存する。
     transcripts: [{"turn_id": 12, "reference_text": "実際に話された正しいテキスト"}, ...]
+    同じturn×同じtranscriber_idで再送すると上書きされる。
     """
-    res = requests.post(
-        f"{BASE_URL}/corpus/{session_id}/reference_transcripts",
-        json={"transcriber_id": transcriber_id, "transcripts": transcripts}
-    )
-    res.raise_for_status()
-    return res.json()
+    conn = get_connection()
+    valid_turn_ids = {
+        row[0] for row in conn.execute(
+            "SELECT id FROM turns WHERE session_id=?", (session_id,)
+        ).fetchall()
+    }
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    saved = 0
+    skipped_turn_ids = []
+    for item in transcripts:
+        turn_id = item["turn_id"]
+        if turn_id not in valid_turn_ids:
+            skipped_turn_ids.append(turn_id)
+            continue
+        conn.execute(
+            """INSERT INTO reference_transcripts (turn_id, transcriber_id, reference_text, created)
+               VALUES (?,?,?,?)
+               ON CONFLICT(turn_id, transcriber_id) DO UPDATE SET
+                   reference_text=excluded.reference_text, created=excluded.created""",
+            (turn_id, transcriber_id, item["reference_text"], now)
+        )
+        saved += 1
+    conn.commit()
+    conn.close()
+    return {
+        "status": "saved", "session_id": session_id, "transcriber_id": transcriber_id,
+        "saved": saved, "skipped_turn_ids": skipped_turn_ids
+    }
 
 
 def get_transcription_accuracy(session_id: int):
-    """保存済みの正解テキストとWhisper出力を突き合わせたWER/CERの集計結果を取得する。"""
-    res = requests.get(f"{BASE_URL}/corpus/{session_id}/transcription_accuracy")
-    res.raise_for_status()
-    return res.json()
+    """保存済みの正解テキストとWhisper出力を突き合わせたWER/CERの集計結果を返す。"""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT rt.turn_id, rt.transcriber_id, rt.reference_text, t.speaker, t.text
+           FROM reference_transcripts rt
+           JOIN turns t ON t.id = rt.turn_id
+           WHERE t.session_id = ?
+           ORDER BY t.start""",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+
+    per_turn = []
+    by_speaker = {}
+    total_wer, total_cer, total_n = 0.0, 0.0, 0
+    for turn_id, transcriber_id, reference_text, speaker, whisper_text in rows:
+        wer = word_error_rate(reference_text, whisper_text)
+        cer = char_error_rate(reference_text, whisper_text)
+        per_turn.append({
+            "turn_id": turn_id,
+            "speaker": speaker,
+            "transcriber_id": transcriber_id,
+            "contains_mask": "[MASK]" in whisper_text,
+            "reference_text": reference_text,
+            "whisper_text": whisper_text,
+            "wer": round(wer, 3) if wer is not None else None,
+            "cer": round(cer, 3) if cer is not None else None
+        })
+        if wer is not None and cer is not None:
+            bucket = by_speaker.setdefault(speaker, {"n": 0, "wer_sum": 0.0, "cer_sum": 0.0})
+            bucket["n"] += 1
+            bucket["wer_sum"] += wer
+            bucket["cer_sum"] += cer
+            total_n += 1
+            total_wer += wer
+            total_cer += cer
+
+    return {
+        "session_id": session_id,
+        "per_turn": per_turn,
+        "by_speaker": [
+            {
+                "speaker": speaker,
+                "n_turns": b["n"],
+                "mean_wer": round(b["wer_sum"] / b["n"], 3),
+                "mean_cer": round(b["cer_sum"] / b["n"], 3)
+            }
+            for speaker, b in by_speaker.items()
+        ],
+        "overall": {
+            "n_turns": total_n,
+            "mean_wer": round(total_wer / total_n, 3) if total_n else None,
+            "mean_cer": round(total_cer / total_n, 3) if total_n else None
+        }
+    }
 
 
 def print_accuracy_report(session_id: int):
@@ -60,25 +216,6 @@ def print_accuracy_report(session_id: int):
         print("       正確な精度検証をしたい場合は、これらのturn_idを除外して再集計してください。")
 
     return data
-
-
-def text_diff(reference, hypothesis):
-    """
-    正解テキストとWhisperテキストを文字単位で比較し、一致していない箇所
-    （置換・削除・追加）のリストを返す。分かち書きしない日本語にも対応するため
-    単語区切りではなく文字単位で差分を取る。
-    """
-    matcher = difflib.SequenceMatcher(None, reference, hypothesis)
-    diffs = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        diffs.append({
-            "type": tag,  # replace / delete / insert
-            "reference": reference[i1:i2],
-            "whisper": hypothesis[j1:j2],
-        })
-    return diffs
 
 
 def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15, save_dir: str = SAVE_DIR):
