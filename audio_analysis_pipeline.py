@@ -149,6 +149,16 @@ except NameError:
 
 conn = init_db()
 
+# torch 2.6以降、torch.loadのデフォルトがweights_only=Trueに変わり、
+# pyannote.audio/Whisperの公式チェックポイント（Hugging Face上の信頼できる配布元）を
+# そのままロードすると UnpicklingError になる。ここでは正規配布元のモデルしか
+# 読み込まないため、旧来の挙動（weights_only=False）に戻す。
+_original_torch_load = torch.load
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _original_torch_load(*args, **kwargs)
+torch.load = _torch_load_compat
+
 print("AIモデルをロード中...")
 diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
