@@ -7,29 +7,20 @@ from datetime import datetime
 from typing import Optional
 
 # torch 2.6以降、torch.loadのデフォルトがweights_only=Trueに変わり、
-# pyannote.audio/Whisperの公式チェックポイント（Hugging Face上の信頼できる配布元）を
-# そのままロードすると UnpicklingError になる。ここでは正規配布元のモデルしか
-# 読み込まないため、旧来の挙動（weights_only=False）に戻す。
-# pyannote.audioなどをimportする「前」にパッチしないと、内部で
-# `from torch import load` のように直接参照を抱えられ、後からtorch.loadを
-# 差し替えても間に合わない（実際にこれで一度ハマった）。
-# さらに、実際のエラー箇所はtorch.serialization.load自体だった
-# （pyannote.audio内部がtorch.serialization.load(...)を直接呼んでおり、
-# torch.load属性だけ差し替えても届いていなかった）ため、両方を差し替える。
-# Colabでセルをカーネル再起動せず再実行すると、この行が二重に適用されて
-# 「パッチ済みの自分自身」を_original_torch_loadとして掴み無限再帰する
-# ことがあるため、二重適用を防ぐガードを入れている。
+# pyannote.audioの公式チェックポイント（lightning_fabricのcloud_io経由でロードされる）
+# が内部でweights_only=Trueを明示指定しているため、torch.load自体を差し替える
+# モンキーパッチでは上書きできなかった（呼び出し元が明示指定した値を後から
+# 差し替える手段がない）。代わりに、weights_only=Trueのままでも
+# 「このクラスは安全」とtorch側の共有レジストリに直接登録する方式に切り替える。
+# ここでは正規配布元（Hugging Face上のpyannote/speaker-diarization-3.1）の
+# モデルしか読み込まないため、必要なクラスを安全とみなして許可している。
+# pyannoteのチェックポイントは複数の独自クラスをpickleに含んでいるため、
+# 今後 "Unsupported global: GLOBAL x.y.Z" のようなエラーが別のクラス名で
+# 出た場合は、そのクラスをimportしてこのリストに追加すること。
 import torch.serialization
-if not getattr(torch.load, "_is_weights_only_compat_patch", False):
-    _original_torch_load = torch.serialization.load
-    def _torch_load_compat(*args, **kwargs):
-        # setdefaultだと、呼び出し元が明示的にweights_only=Trueを渡している場合に
-        # 上書きされない（実際にこれで一度ハマった）ため、強制的に上書きする。
-        kwargs["weights_only"] = False
-        return _original_torch_load(*args, **kwargs)
-    _torch_load_compat._is_weights_only_compat_patch = True
-    torch.load = _torch_load_compat
-    torch.serialization.load = _torch_load_compat
+from torch.torch_version import TorchVersion
+from pyannote.audio.core.task import Specifications
+torch.serialization.add_safe_globals([TorchVersion, Specifications])
 
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
