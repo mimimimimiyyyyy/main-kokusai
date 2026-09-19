@@ -23,7 +23,9 @@ import torch.serialization
 if not getattr(torch.load, "_is_weights_only_compat_patch", False):
     _original_torch_load = torch.serialization.load
     def _torch_load_compat(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
+        # setdefaultだと、呼び出し元が明示的にweights_only=Trueを渡している場合に
+        # 上書きされない（実際にこれで一度ハマった）ため、強制的に上書きする。
+        kwargs["weights_only"] = False
         return _original_torch_load(*args, **kwargs)
     _torch_load_compat._is_weights_only_compat_patch = True
     torch.load = _torch_load_compat
