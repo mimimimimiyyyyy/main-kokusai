@@ -5,6 +5,20 @@ import os, openai, torch, json, numpy as np, pandas as pd, matplotlib.pyplot as 
 import japanize_matplotlib, time, warnings, whisper, shutil, io, base64, sqlite3
 from datetime import datetime
 from typing import Optional
+
+# torch 2.6以降、torch.loadのデフォルトがweights_only=Trueに変わり、
+# pyannote.audio/Whisperの公式チェックポイント（Hugging Face上の信頼できる配布元）を
+# そのままロードすると UnpicklingError になる。ここでは正規配布元のモデルしか
+# 読み込まないため、旧来の挙動（weights_only=False）に戻す。
+# pyannote.audioなどをimportする「前」にパッチしないと、内部で
+# `from torch import load` のように直接参照を抱えられ、後からtorch.loadを
+# 差し替えても間に合わない（実際にこれで一度ハマった）。
+_original_torch_load = torch.load
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _original_torch_load(*args, **kwargs)
+torch.load = _torch_load_compat
+
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
 from google.colab import userdata
@@ -148,16 +162,6 @@ except NameError:
     pass
 
 conn = init_db()
-
-# torch 2.6以降、torch.loadのデフォルトがweights_only=Trueに変わり、
-# pyannote.audio/Whisperの公式チェックポイント（Hugging Face上の信頼できる配布元）を
-# そのままロードすると UnpicklingError になる。ここでは正規配布元のモデルしか
-# 読み込まないため、旧来の挙動（weights_only=False）に戻す。
-_original_torch_load = torch.load
-def _torch_load_compat(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _original_torch_load(*args, **kwargs)
-torch.load = _torch_load_compat
 
 print("AIモデルをロード中...")
 diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
