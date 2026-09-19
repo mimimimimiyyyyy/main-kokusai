@@ -19,8 +19,8 @@ from typing import Optional
 # 出た場合は、そのクラスをimportしてこのリストに追加すること。
 import torch.serialization
 from torch.torch_version import TorchVersion
-from pyannote.audio.core.task import Specifications, Problem
-torch.serialization.add_safe_globals([TorchVersion, Specifications, Problem])
+from pyannote.audio.core.task import Specifications, Problem, Resolution
+torch.serialization.add_safe_globals([TorchVersion, Specifications, Problem, Resolution])
 
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
