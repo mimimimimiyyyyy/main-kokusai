@@ -13,11 +13,16 @@ from typing import Optional
 # pyannote.audioなどをimportする「前」にパッチしないと、内部で
 # `from torch import load` のように直接参照を抱えられ、後からtorch.loadを
 # 差し替えても間に合わない（実際にこれで一度ハマった）。
-_original_torch_load = torch.load
-def _torch_load_compat(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _original_torch_load(*args, **kwargs)
-torch.load = _torch_load_compat
+# Colabでセルをカーネル再起動せず再実行すると、この行が二重に適用されて
+# 「パッチ済みの自分自身」を_original_torch_loadとして掴み無限再帰する
+# ことがあるため、二重適用を防ぐガードを入れている。
+if not getattr(torch.load, "_is_weights_only_compat_patch", False):
+    _original_torch_load = torch.load
+    def _torch_load_compat(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _original_torch_load(*args, **kwargs)
+    _torch_load_compat._is_weights_only_compat_patch = True
+    torch.load = _torch_load_compat
 
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
