@@ -5,6 +5,7 @@
 # 複製している。ロジックを変更した場合は両方に反映すること。
 
 import difflib
+import re
 import sqlite3
 from datetime import datetime
 
@@ -106,6 +107,152 @@ def text_diff(reference, hypothesis):
             "whisper": hypothesis[j1:j2],
         })
     return diffs
+
+
+_TIME_RANGE_RE = re.compile(
+    r'(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})'
+)
+
+
+def _to_seconds(h, m, s, ms):
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+
+def parse_reference_file(path):
+    """
+    "00:32:54.000 --> 00:33:00.000" のようなタイムスタンプ区間の後にテキストが続く
+    ファイル（zenhann_hyouka.txtのような形式）を読み込み、
+    [{"start": 秒, "end": 秒, "text": ...}, ...] を時系列で返す。
+    区間番号の行があってもなくても、タイムスタンプ行を探して処理するので影響しない。
+    """
+    content = open(path, encoding="utf-8").read()
+    blocks = re.split(r"\n\s*\n", content.strip())
+    segments = []
+    for block in blocks:
+        lines = [l for l in block.strip().split("\n") if l.strip() != ""]
+        ts_idx = None
+        for i, line in enumerate(lines):
+            if _TIME_RANGE_RE.search(line):
+                ts_idx = i
+                break
+        if ts_idx is None:
+            continue
+        m = _TIME_RANGE_RE.search(lines[ts_idx])
+        start = _to_seconds(*m.groups()[0:4])
+        end = _to_seconds(*m.groups()[4:8])
+        text = " ".join(lines[ts_idx + 1:]).strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
+def evaluate_against_reference_file(session_id: int, reference_file_path: str,
+                                     cer_threshold: float = 0.3, save_dir: str = SAVE_DIR):
+    """
+    turn単位の正解ではなく、タイムスタンプ区間ごとのテキストファイル
+    （zenhann_hyouka.txtのような形式）を正解として評価する。
+    1つの区間が複数のturnにまたがることが多いため、submit_reference_transcripts
+    （turn単位）は使わず、区間の時間窓に重なるturnのテキストを連結して比較する。
+
+    正解ファイルの時刻は、turnsの開始時刻(0秒付近)とはズレている前提
+    （例: 元の長い録画の32:54〜42:58を切り出したクリップがzenhan.mp4になっている場合、
+    正解ファイル側は32:54始まりのままになる）。正解ファイルの最初のセグメント開始時刻と
+    turnsの最初の開始時刻の差を自動的にオフセットとして推定する。
+    """
+    segments = parse_reference_file(reference_file_path)
+    if not segments:
+        print("正解ファイルからセグメントを読み取れませんでした。")
+        return None
+
+    conn = get_connection()
+    turns = conn.execute(
+        "SELECT id, speaker, start, end, text FROM turns WHERE session_id=? ORDER BY start",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+    if not turns:
+        print(f"session_id={session_id} のturnsが見つかりません。")
+        return None
+
+    offset = segments[0]["start"] - turns[0][2]
+    print(f"推定オフセット: {offset:.1f}秒（正解ファイルの先頭とturnsの先頭を揃えています）")
+
+    rows = []
+    for seg in segments:
+        win_start = seg["start"] - offset
+        win_end = seg["end"] - offset
+        overlapped = [t for t in turns if t[2] < win_end and t[3] > win_start]
+        whisper_text = " ".join(t[4] for t in overlapped)
+        cer = char_error_rate(seg["text"], whisper_text)
+        rows.append({
+            "ref_start": seg["start"],
+            "ref_end": seg["end"],
+            "reference_text": seg["text"],
+            "whisper_text": whisper_text,
+            "n_matched_turns": len(overlapped),
+            "contains_mask": "[MASK]" in whisper_text,
+            "cer": round(cer, 3) if cer is not None else None,
+            "diffs": text_diff(seg["text"], whisper_text)
+        })
+
+    rows_with_cer = [r for r in rows if r["cer"] is not None]
+    for r in rows_with_cer:
+        r["is_significant"] = r["cer"] >= cer_threshold
+
+    # --- 可視化 ---
+    x = list(range(len(rows_with_cer)))
+    accuracy = [max(0, 1 - r["cer"]) for r in rows_with_cer]
+    COLOR_LOW, COLOR_OK = "#d62728", "#2ca02c"
+    colors = [COLOR_LOW if r["is_significant"] else COLOR_OK for r in rows_with_cer]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(x) * 0.3), 5))
+    ax.bar(x, accuracy, color=colors)
+    ax.set_xlabel("正解セグメント順")
+    ax.set_ylabel("文字一致率 (1 - CER)")
+    ax.set_ylim(0, 1.05)
+    ax.set_title(f"セッション{session_id}: 正解ファイルとDB文字起こしの文字一致率")
+    ax.axhline(1 - cer_threshold, color="gray", linestyle="--", linewidth=1)
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, color=COLOR_OK, label=f"一致率 ≥ {1 - cer_threshold:.0%}"),
+        plt.Rectangle((0, 0), 1, 1, color=COLOR_LOW, label=f"一致率 < {1 - cer_threshold:.0%}"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right")
+    plt.tight_layout()
+
+    chart_path = f"{save_dir}/session_{session_id}_reference_file_chart.png"
+    plt.savefig(chart_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"チャートを保存しました: {chart_path}")
+
+    # --- CSV保存 ---
+    report_path = f"{save_dir}/session_{session_id}_reference_file_report.csv"
+    report_df = pd.DataFrame([
+        {
+            "ref_start": r["ref_start"], "ref_end": r["ref_end"],
+            "cer": r["cer"], "n_matched_turns": r["n_matched_turns"],
+            "below_threshold": r.get("is_significant"), "contains_mask": r["contains_mask"],
+            "reference_text": r["reference_text"], "whisper_text": r["whisper_text"],
+            "diff": " / ".join(f"{d['type']}:「{d['reference']}」→「{d['whisper']}」" for d in r["diffs"])
+        }
+        for r in rows
+    ])
+    report_df.to_csv(report_path, index=False, encoding="utf-8-sig")
+    print(f"レポートを保存しました: {report_path}")
+
+    overall_cer = sum(r["cer"] for r in rows_with_cer) / len(rows_with_cer)
+    print(f"\nセグメント単位の平均CER: {overall_cer:.3f}")
+
+    # --- 一致率が低いセグメントの一覧 ---
+    significant = [r for r in rows_with_cer if r["is_significant"]]
+    print(f"\n=== 文字一致率が{1 - cer_threshold:.0%}未満のセグメント: {len(significant)}件 / {len(rows_with_cer)}件中 ===\n")
+    for r in sorted(significant, key=lambda r: r["cer"], reverse=True):
+        mask_note = "　※匿名化([MASK])による差分の可能性あり" if r["contains_mask"] else ""
+        print(f"[{r['ref_start']}s] CER={r['cer']}  対応turn数={r['n_matched_turns']}{mask_note}")
+        print(f"  正解    : {r['reference_text']}")
+        print(f"  DB      : {r['whisper_text']}")
+        print()
+
+    return rows
 
 
 def get_raw_turns(session_id: int):
@@ -353,3 +500,11 @@ def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15, save_dir
 
 # 4. 文字一致率を可視化し、一致率が低い発話だけを差分付きで一覧表示する
 # analyze_and_visualize(session_id=1, cer_threshold=0.15)
+
+# 5. turn単位の正解を1件ずつ登録する代わりに、タイムスタンプ区間テキストファイル
+#    （zenhann_hyouka.txtのような形式）をまとめて正解として評価する場合
+# evaluate_against_reference_file(
+#     session_id=3,
+#     reference_file_path="/content/drive/MyDrive/zenhann_hyouka.txt",
+#     cer_threshold=0.3
+# )
