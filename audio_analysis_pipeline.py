@@ -170,7 +170,7 @@ print("AIモデルをロード中...")
 diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 diarization_pipeline.to(device)
-whisper_model = whisper.load_model("small", device=device)
+whisper_model = whisper.load_model("medium", device=device)
 warnings.filterwarnings("ignore")
 
 # --- 3. フル解析ロジック ---
