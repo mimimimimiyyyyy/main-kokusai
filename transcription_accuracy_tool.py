@@ -184,6 +184,7 @@ def evaluate_against_reference_file(session_id: int, reference_file_path: str,
         overlapped = [t for t in turns if t[2] < win_end and t[3] > win_start]
         whisper_text = " ".join(t[4] for t in overlapped)
         cer = char_error_rate(seg["text"], whisper_text)
+        sim = semantic_similarity(seg["text"], whisper_text)
         rows.append({
             "ref_start": seg["start"],
             "ref_end": seg["end"],
@@ -192,22 +193,29 @@ def evaluate_against_reference_file(session_id: int, reference_file_path: str,
             "n_matched_turns": len(overlapped),
             "contains_mask": "[MASK]" in whisper_text,
             "cer": round(cer, 3) if cer is not None else None,
+            "semantic_similarity": round(sim, 3) if sim is not None else None,
             "diffs": text_diff(seg["text"], whisper_text)
         })
 
-    rows_with_cer = [r for r in rows if r["cer"] is not None]
-    for r in rows_with_cer:
-        r["is_significant"] = r["cer"] >= cer_threshold
+    # 「文字起こしの精度が低い」のか「そもそも対応turnが無い(検出漏れ)」のかは
+    # 別の問題なので分けて扱う。検出漏れ(n_matched_turns=0)はCER=1.0で平均に
+    # 混ぜず、別枠として件数だけ報告する。
+    undetected = [r for r in rows if r["n_matched_turns"] == 0]
+    detected = [r for r in rows if r["n_matched_turns"] > 0]
+    for r in detected:
+        r["is_significant"] = r["cer"] is not None and r["cer"] >= cer_threshold
 
-    # --- 可視化 ---
-    x = list(range(len(rows_with_cer)))
-    accuracy = [max(0, 1 - r["cer"]) for r in rows_with_cer]
+    SIM_HIGH_THRESHOLD = 0.85  # これ以上なら「文字は違うが意味はほぼ同じ」とみなす目安
+
+    # --- 可視化: 検出できたセグメントのみ対象。緑=一致、赤=低一致 で色分けする ---
+    x = list(range(len(detected)))
+    accuracy = [max(0, 1 - r["cer"]) for r in detected]
     COLOR_LOW, COLOR_OK = "#d62728", "#2ca02c"
-    colors = [COLOR_LOW if r["is_significant"] else COLOR_OK for r in rows_with_cer]
+    colors = [COLOR_LOW if r["is_significant"] else COLOR_OK for r in detected]
 
     fig, ax = plt.subplots(figsize=(max(10, len(x) * 0.3), 5))
     ax.bar(x, accuracy, color=colors)
-    ax.set_xlabel("正解セグメント順")
+    ax.set_xlabel("正解セグメント順（検出漏れを除く）")
     ax.set_ylabel("文字一致率 (1 - CER)")
     ax.set_ylim(0, 1.05)
     ax.set_title(f"セッション{session_id}: 正解ファイルとDB文字起こしの文字一致率")
@@ -229,7 +237,8 @@ def evaluate_against_reference_file(session_id: int, reference_file_path: str,
     report_df = pd.DataFrame([
         {
             "ref_start": r["ref_start"], "ref_end": r["ref_end"],
-            "cer": r["cer"], "n_matched_turns": r["n_matched_turns"],
+            "cer": r["cer"], "semantic_similarity": r["semantic_similarity"],
+            "n_matched_turns": r["n_matched_turns"], "undetected": r["n_matched_turns"] == 0,
             "below_threshold": r.get("is_significant"), "contains_mask": r["contains_mask"],
             "reference_text": r["reference_text"], "whisper_text": r["whisper_text"],
             "diff": " / ".join(f"{d['type']}:「{d['reference']}」→「{d['whisper']}」" for d in r["diffs"])
@@ -239,15 +248,31 @@ def evaluate_against_reference_file(session_id: int, reference_file_path: str,
     report_df.to_csv(report_path, index=False, encoding="utf-8-sig")
     print(f"レポートを保存しました: {report_path}")
 
-    overall_cer = sum(r["cer"] for r in rows_with_cer) / len(rows_with_cer)
-    print(f"\nセグメント単位の平均CER: {overall_cer:.3f}")
+    overall_cer = sum(r["cer"] for r in detected) / len(detected) if detected else None
+    overall_sim = (
+        sum(r["semantic_similarity"] for r in detected if r["semantic_similarity"] is not None)
+        / len([r for r in detected if r["semantic_similarity"] is not None])
+        if detected else None
+    )
+    print(f"\n検出漏れ（対応turnが無い区間）: {len(undetected)}件 / {len(rows)}件中"
+          "　※これらはCER計算から除外しています")
+    print(f"検出できた{len(detected)}件の平均CER: {overall_cer:.3f}" if overall_cer is not None else "")
+    print(f"検出できた{len(detected)}件の平均意味的類似度: {overall_sim:.3f}" if overall_sim is not None else "")
 
-    # --- 一致率が低いセグメントの一覧 ---
-    significant = [r for r in rows_with_cer if r["is_significant"]]
-    print(f"\n=== 文字一致率が{1 - cer_threshold:.0%}未満のセグメント: {len(significant)}件 / {len(rows_with_cer)}件中 ===\n")
+    if undetected:
+        print(f"\n=== 検出漏れ区間: {len(undetected)}件 ===\n")
+        for r in undetected:
+            print(f"[{r['ref_start']}s〜{r['ref_end']}s] 正解: {r['reference_text']}")
+        print()
+
+    # --- 一致率が低いセグメントの一覧（検出できたもののみ対象） ---
+    significant = [r for r in detected if r["is_significant"]]
+    print(f"\n=== 文字一致率が{1 - cer_threshold:.0%}未満のセグメント: {len(significant)}件 / {len(detected)}件中（検出できた分） ===\n")
     for r in sorted(significant, key=lambda r: r["cer"], reverse=True):
         mask_note = "　※匿名化([MASK])による差分の可能性あり" if r["contains_mask"] else ""
-        print(f"[{r['ref_start']}s] CER={r['cer']}  対応turn数={r['n_matched_turns']}{mask_note}")
+        sim = r["semantic_similarity"]
+        sim_note = "　※意味的には近い可能性あり（言い換え等）" if sim is not None and sim >= SIM_HIGH_THRESHOLD else ""
+        print(f"[{r['ref_start']}s] CER={r['cer']}  意味的類似度={sim}  対応turn数={r['n_matched_turns']}{mask_note}{sim_note}")
         print(f"  正解    : {r['reference_text']}")
         print(f"  DB      : {r['whisper_text']}")
         print()
