@@ -569,7 +569,12 @@ class ReferenceTranscriptRequest(BaseModel):
 
 
 @app.post("/upload")
-async def api_upload(file: UploadFile = File(...)):
+# 話者分離・Whisper・GPT-4o呼び出しを含む重い処理(run_full_analysis)を
+# async defの中でawaitせず直接呼ぶと、その間イベントループがブロックされ、
+# ngrokとの接続が切れてブラウザ側だけ失敗したように見える(サーバー側は後で
+# 200 OKを返すが、既に誰も聞いていない)。普通のdefにすることで、FastAPIが
+# 自動的に別スレッドで実行し、イベントループを塞がないようにする。
+def api_upload(file: UploadFile = File(...)):
     temp_file = f"input_{file.filename}"
     with open(temp_file, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -577,7 +582,9 @@ async def api_upload(file: UploadFile = File(...)):
 
 
 @app.post("/search")
-async def api_search(req: SearchRequest):
+def api_search(req: SearchRequest):
+    # client.embeddings.create はブロッキング呼び出しなので、/uploadと同じ理由で
+    # async defにしない（イベントループを塞いでngrok接続がタイムアウトするのを防ぐ）。
     # 直近アップロード分だけのインメモリ状態ではなく、DBに永続化された
     # 全セッションのturnsを対象に検索する。過去に保存した分析結果を
     # セッション横断で再利用できるようにするための変更。
@@ -706,7 +713,9 @@ async def api_raw_turns(session_id: int):
 
 
 @app.post("/corpus/{session_id}/retag")
-async def api_retag(session_id: int, req: RetagRequest):
+# tag_turns_with_gptはGPT-4oを繰り返し呼ぶ重い処理なので、/uploadと同じ理由で
+# async defにしない（イベントループを塞いでngrok接続がタイムアウトするのを防ぐ）。
+def api_retag(session_id: int, req: RetagRequest):
     # 既存の文字起こし結果に対して、新しいphase/intentタグ付けロジックを
     # 適用し直す。turnsは上書きせず、結果はaddin_resultsにバージョン付きで
     # 追加保存するので、旧手法の結果と比較・再利用できる。
