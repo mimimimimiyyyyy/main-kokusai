@@ -3,6 +3,7 @@
 
 import os, openai, torch, json, numpy as np, pandas as pd, matplotlib.pyplot as plt
 import japanize_matplotlib, time, warnings, whisper, shutil, io, base64, sqlite3
+import threading, uuid, traceback
 from datetime import datetime
 from typing import Optional
 
@@ -45,6 +46,15 @@ client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
 
 TARGET_NUM_SPEAKERS = 4
 TEMP_SEGMENT_FILE = "temp_segment.wav"
+
+# jobs: /uploadを1回のHTTPリクエストで完結させず、ジョブID発行→バックグラウンド処理→
+# ポーリングという方式に変えるための状態置き場。話者分離・Whisper・GPT-4oを含む
+# フル解析は数分かかることがあり、その間ngrokの無料枠トンネルが接続をタイムアウト
+# させてしまう（サーバー側は最後まで処理して200 OKを返すのに、ブラウザ側は
+# 「Failed to fetch」になる）。これを避けるため、/uploadはジョブIDを即座に返し、
+# 実処理は別スレッドで行い、フロントエンドは/jobs/{job_id}を定期的にポーリングする。
+jobs = {}
+jobs_lock = threading.Lock()
 
 PHASE_ORDER = ['Introduction', 'Information Sharing', 'Conflict', 'Conclusion', 'Agreement']
 INTENT_LABELS = ["Proposal", "Question", "Agreement", "Disagreement", "Confirmation", "Acknowledge", "Explanation"]
@@ -568,17 +578,47 @@ class ReferenceTranscriptRequest(BaseModel):
     transcripts: list[ReferenceTranscriptItem]
 
 
+def _run_upload_job(job_id, temp_file):
+    try:
+        result = run_full_analysis(temp_file)
+        with jobs_lock:
+            jobs[job_id] = {"status": "done", "result": result}
+    except Exception as e:
+        traceback.print_exc()
+        with jobs_lock:
+            jobs[job_id] = {"status": "error", "error": str(e)}
+
+
 @app.post("/upload")
-# 話者分離・Whisper・GPT-4o呼び出しを含む重い処理(run_full_analysis)を
-# async defの中でawaitせず直接呼ぶと、その間イベントループがブロックされ、
-# ngrokとの接続が切れてブラウザ側だけ失敗したように見える(サーバー側は後で
-# 200 OKを返すが、既に誰も聞いていない)。普通のdefにすることで、FastAPIが
-# 自動的に別スレッドで実行し、イベントループを塞がないようにする。
+# 話者分離・Whisper・GPT-4o呼び出しを含むフル解析は数分かかることがあり、
+# 1回のHTTPリクエストで結果を待つ方式だとngrok無料枠のトンネルが途中で
+# タイムアウトしてしまう（サーバー側は最後まで処理して200 OKを返すのに、
+# ブラウザ側は「Failed to fetch」になる）。async/defの違いでは解決しないため
+# （イベントループのブロックが原因ではなかった）、ジョブIDを即座に返し、
+# 実処理はバックグラウンドスレッドで行う方式に変更した。
+# フロントエンドは戻り値のjob_idで /jobs/{job_id} を定期的にポーリングする。
 def api_upload(file: UploadFile = File(...)):
     temp_file = f"input_{file.filename}"
     with open(temp_file, "wb") as f:
         shutil.copyfileobj(file.file, f)
-    return run_full_analysis(temp_file)
+
+    job_id = uuid.uuid4().hex
+    with jobs_lock:
+        jobs[job_id] = {"status": "processing"}
+
+    thread = threading.Thread(target=_run_upload_job, args=(job_id, temp_file), daemon=True)
+    thread.start()
+
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/jobs/{job_id}")
+async def api_job_status(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if job is None:
+        return {"status": "error", "error": "Job not found"}
+    return {"job_id": job_id, **job}
 
 
 @app.post("/search")
