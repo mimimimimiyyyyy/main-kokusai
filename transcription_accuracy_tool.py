@@ -533,3 +533,17 @@ def analyze_and_visualize(session_id: int, cer_threshold: float = 0.15, save_dir
 #     reference_file_path="/content/drive/MyDrive/zenhann_hyouka.txt",
 #     cer_threshold=0.3
 # )
+
+# 6. 最新セッション（直近アップロード分）に対して自動的に評価する
+_conn = sqlite3.connect(DB_PATH)
+latest_session_id, latest_filename = _conn.execute(
+    "SELECT id, filename FROM sessions ORDER BY id DESC LIMIT 1"
+).fetchone()
+_conn.close()
+print(f"最新セッション: session_id={latest_session_id} ({latest_filename})")
+
+evaluate_against_reference_file(
+    session_id=latest_session_id,
+    reference_file_path="/content/drive/MyDrive/zenhann_hyouka.txt",
+    cer_threshold=0.3
+)
