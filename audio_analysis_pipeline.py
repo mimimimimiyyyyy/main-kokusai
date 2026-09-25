@@ -443,6 +443,45 @@ def render_analysis_charts(all_turns):
     return img_base64
 
 
+# Whisperは無音・ノイズ区間に対して、学習データ(大量のYouTube動画)に頻出する
+# 定型文("Thanks for watching!"等)を高い確信度で生成してしまうことがある
+# (いわゆる幻覚)。話者分離が短い/無音気味の区間を誤って「発話」と検出すると、
+# そこにこの幻覚テキストが混入し、文字起こし精度を大きく下げる原因になっていた
+# (実データで確認済み: whisperのモデルサイズをsmall→mediumに変えても改善しなかった)。
+# no_speech_prob/avg_logprobだけでは「モデルが確信を持って幻覚している」ケースを
+# 検出しきれないため、実データで頻出した定型フレーズのブロックリストも併用する。
+WHISPER_NO_SPEECH_THRESHOLD = 0.6
+WHISPER_LOGPROB_THRESHOLD = -1.0
+WHISPER_HALLUCINATION_PHRASES = {
+    "thanks for watching", "thank you for watching", "thank you for your support",
+    "please subscribe", "like and subscribe", "see you next time",
+    "don't forget to subscribe", "bye", "bye bye",
+}
+
+
+def transcribe_segment(audio_path):
+    """
+    diarizationで切り出した短い音声区間をWhisperで文字起こしする。
+    (1) セグメント単位のno_speech_prob/avg_logprobで信頼度が低いものを除外し、
+    (2) それだけで構成されるセグメントが既知の幻覚フレーズと一致する場合も除外する、
+    二段構えでフィルタする。
+    """
+    result = whisper_model.transcribe(audio_path)
+    kept = []
+    for seg in result.get("segments") or []:
+        no_speech_prob = seg.get("no_speech_prob", 0.0)
+        avg_logprob = seg.get("avg_logprob", 0.0)
+        if no_speech_prob > WHISPER_NO_SPEECH_THRESHOLD and avg_logprob < WHISPER_LOGPROB_THRESHOLD:
+            continue
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        if text.lower().strip(" .!?") in WHISPER_HALLUCINATION_PHRASES:
+            continue
+        kept.append(text)
+    return " ".join(kept).strip()
+
+
 def run_full_analysis(video_path):
     # A. 音声変換
     full_audio = AudioSegment.from_file(video_path).set_frame_rate(16000).set_channels(1)
@@ -456,7 +495,7 @@ def run_full_analysis(video_path):
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         seg = full_audio[int(turn.start*1000):int(turn.end*1000)]
         seg.export(TEMP_SEGMENT_FILE, format="wav")
-        text = whisper_model.transcribe(TEMP_SEGMENT_FILE)['text'].strip()
+        text = transcribe_segment(TEMP_SEGMENT_FILE)
         if text:
             speaker_results.setdefault(speaker, []).append({
                 "start": round(turn.start, 2),
