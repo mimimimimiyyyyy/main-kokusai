@@ -4,6 +4,7 @@
 import os, openai, torch, json, numpy as np, pandas as pd, matplotlib.pyplot as plt
 import japanize_matplotlib, time, warnings, whisper, shutil, io, base64, sqlite3
 import threading, uuid, traceback
+from collections import Counter
 from datetime import datetime
 from typing import Optional
 
@@ -457,6 +458,12 @@ WHISPER_HALLUCINATION_PHRASES = {
     "please subscribe", "like and subscribe", "see you next time",
     "don't forget to subscribe", "bye", "bye bye",
 }
+# no_speech_prob/avg_logprobのフィルタを通した後も、無音・ノイズ区間に対して
+# ヒンディー語・韓国語・ロシア語などのランダムな断片を「確信度高く」幻覚生成する
+# ケースが実データで確認された。これはセッションの主言語（多数決）と異なる言語が
+# 検出された場合にのみ、より厳しい信頼度基準を要求することで対応する
+# （本当に多言語の会話であれば、確信度の高い発話は残る）。
+WHISPER_LANGUAGE_MISMATCH_LOGPROB_THRESHOLD = -0.5
 
 
 def transcribe_segment(audio_path):
@@ -465,9 +472,11 @@ def transcribe_segment(audio_path):
     (1) セグメント単位のno_speech_prob/avg_logprobで信頼度が低いものを除外し、
     (2) それだけで構成されるセグメントが既知の幻覚フレーズと一致する場合も除外する、
     二段構えでフィルタする。
+    戻り値: (文字起こしテキスト, 検出言語, 採用したセグメントの平均avg_logprob)
     """
     result = whisper_model.transcribe(audio_path)
     kept = []
+    logprobs = []
     for seg in result.get("segments") or []:
         no_speech_prob = seg.get("no_speech_prob", 0.0)
         avg_logprob = seg.get("avg_logprob", 0.0)
@@ -479,7 +488,10 @@ def transcribe_segment(audio_path):
         if text.lower().strip(" .!?") in WHISPER_HALLUCINATION_PHRASES:
             continue
         kept.append(text)
-    return " ".join(kept).strip()
+        logprobs.append(avg_logprob)
+    combined_text = " ".join(kept).strip()
+    mean_logprob = sum(logprobs) / len(logprobs) if logprobs else None
+    return combined_text, result.get("language"), mean_logprob
 
 
 def run_full_analysis(video_path):
@@ -491,22 +503,35 @@ def run_full_analysis(video_path):
     # B. 話者分離 & 文字起こし
     print("話者分離と文字起こしを実行中...")
     diarization = diarization_pipeline(audio_data_dict, num_speakers=TARGET_NUM_SPEAKERS)
-    speaker_results = {}
+    pending_turns = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         seg = full_audio[int(turn.start*1000):int(turn.end*1000)]
         seg.export(TEMP_SEGMENT_FILE, format="wav")
-        text = transcribe_segment(TEMP_SEGMENT_FILE)
+        text, language, avg_logprob = transcribe_segment(TEMP_SEGMENT_FILE)
         if text:
-            speaker_results.setdefault(speaker, []).append({
+            pending_turns.append({
+                "speaker": speaker,
                 "start": round(turn.start, 2),
                 "end": round(turn.end, 2),
-                "text": text
+                "text": text,
+                "language": language,
+                "avg_logprob": avg_logprob
             })
 
+    # このセッションで最も多く検出された言語を「主言語」とみなし、それと異なる言語が
+    # 検出された発話は、より厳しい信頼度基準(avg_logprob)を満たさない限り除外する。
+    # (本当に多言語の会話であれば、確信度の高い発話は残る)
+    language_counts = Counter(t["language"] for t in pending_turns if t["language"])
+    primary_language = language_counts.most_common(1)[0][0] if language_counts else None
+
     all_turns = []
-    for spk, utts in speaker_results.items():
-        for u in utts:
-            all_turns.append({"speaker": spk, **u})
+    for t in pending_turns:
+        if primary_language and t["language"] != primary_language:
+            if t["avg_logprob"] is None or t["avg_logprob"] < WHISPER_LANGUAGE_MISMATCH_LOGPROB_THRESHOLD:
+                continue
+        all_turns.append({
+            "speaker": t["speaker"], "start": t["start"], "end": t["end"], "text": t["text"]
+        })
     all_turns.sort(key=lambda x: x['start'])
 
     # C. メタデータ・要約判定
