@@ -464,6 +464,12 @@ WHISPER_HALLUCINATION_PHRASES = {
 # 検出された場合にのみ、より厳しい信頼度基準を要求することで対応する
 # （本当に多言語の会話であれば、確信度の高い発話は残る）。
 WHISPER_LANGUAGE_MISMATCH_LOGPROB_THRESHOLD = -0.5
+# temperature=0.0(貪欲デコード固定)にした副作用で、実質無音の区間に対して
+# 同じ文字列を延々と繰り返す退化した出力(例: "Hmmmm..."が数百文字続く)が
+# 稀に発生することが実データで確認された。compression_ratio(テキストの
+# 繰り返しの多さを示す指標)が異常に高いセグメントを検出して除外する。
+# 2.4はWhisper自身のデフォルトのcompression_ratio_thresholdと同じ値。
+WHISPER_COMPRESSION_RATIO_THRESHOLD = 2.4
 
 
 def transcribe_segment(audio_path):
@@ -487,6 +493,8 @@ def transcribe_segment(audio_path):
         no_speech_prob = seg.get("no_speech_prob", 0.0)
         avg_logprob = seg.get("avg_logprob", 0.0)
         if no_speech_prob > WHISPER_NO_SPEECH_THRESHOLD and avg_logprob < WHISPER_LOGPROB_THRESHOLD:
+            continue
+        if seg.get("compression_ratio", 0.0) > WHISPER_COMPRESSION_RATIO_THRESHOLD:
             continue
         text = seg.get("text", "").strip()
         if not text:
