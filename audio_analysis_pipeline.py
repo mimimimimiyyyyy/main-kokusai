@@ -489,7 +489,16 @@ def transcribe_full_audio(audio_path):
     # 決定的な貪欲デコード1回のみに固定する。
     # word_timestamps=Trueで単語単位のタイムスタンプも取得し、話者の切り替え
     # 判定に使う。
-    result = whisper_model.transcribe(audio_path, temperature=0.0, word_timestamps=True)
+    # condition_on_previous_text=Falseにしないと、無音・ノイズ区間で幻覚
+    # (意味不明なテキスト)が発生した際、その壊れたテキストが次以降のセグメントの
+    # デコード時に文脈(プロンプト)として使われ続け、モデルが「もう文字起こし
+    # すべき音声が残っていない」と誤判断して、音声の途中で実質的に処理が
+    # 止まってしまう(実データで、約600秒の音声のうち170秒あたりで打ち切られる
+    # 現象として確認された)。temperature=0.0に固定してフォールバックを無効化
+    # したことで、一度壊れると立て直せなくなり、この問題が顕在化しやすくなった。
+    result = whisper_model.transcribe(
+        audio_path, temperature=0.0, word_timestamps=True, condition_on_previous_text=False
+    )
     kept = []
     for seg in result.get("segments") or []:
         no_speech_prob = seg.get("no_speech_prob", 0.0)
