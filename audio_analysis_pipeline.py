@@ -508,19 +508,27 @@ def transcribe_full_audio(audio_path):
     return kept
 
 
-def assign_speaker(seg_start, seg_end, diarization):
+def get_diarization_turns(diarization):
+    """diarizationの話者区間を(start, end, speaker)のリストとして取り出す。"""
+    return [(turn.start, turn.end, speaker) for turn, _, speaker in diarization.itertracks(yield_label=True)]
+
+
+def assign_diarization_turn(t_start, t_end, diarization_turns):
     """
-    時間範囲(seg_start〜seg_end)と最も重なりが大きいdiarizationの話者区間を
-    探し、その話者IDを返す。重なりが全く無い場合はNoneを返す(無音の隙間などに
-    できたセグメントは、どの話者の発話か判断できないため除外する)。
+    時間範囲(t_start〜t_end)と最も重なりが大きいdiarizationの話者区間を探し、
+    (その区間のインデックス, 話者ID)を返す。重なりが全く無い場合は(None, None)。
+    区間のインデックスまで返すのは、後続処理で「話者が変わったら発話を区切る」
+    のではなく「pyannoteが元々つけた発話区間が変わったら区切る」ようにするため
+    （詳細はrun_full_analysis内のコメント参照）。
     """
-    best_speaker, best_overlap = None, 0.0
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        overlap = min(seg_end, turn.end) - max(seg_start, turn.start)
+    best_index, best_speaker, best_overlap = None, None, 0.0
+    for i, (turn_start, turn_end, speaker) in enumerate(diarization_turns):
+        overlap = min(t_end, turn_end) - max(t_start, turn_start)
         if overlap > best_overlap:
             best_overlap = overlap
+            best_index = i
             best_speaker = speaker
-    return best_speaker
+    return best_index, best_speaker
 
 
 def run_full_analysis(video_path):
@@ -539,24 +547,32 @@ def run_full_analysis(video_path):
     full_audio.export(TEMP_SEGMENT_FILE, format="wav")
     whisper_segments = transcribe_full_audio(TEMP_SEGMENT_FILE)
 
-    # 単語単位でdiarizationと突き合わせ、話者が切り替わるたびに新しい発話(turn)を
-    # 作る。Whisperのセグメントの境界は話者の切れ目と一致しないことが多く、
-    # セグメント単位で話者を割り当てると、セグメント内で話者が入れ替わった分の
-    # 発言が丸ごと片方の話者に飲み込まれ、話者分布が偏る問題があったため。
+    # 単語単位でdiarizationと突き合わせるが、区切りは「話者が変わったら」ではなく
+    # 「pyannoteが元々つけた発話区間(turn)が変わったら」にする。話者が変わったら
+    # 区切る方式だと、同じ話者が長く話し続ける間ずっと1つの発話に融合されてしまい、
+    # pyannote本来の間・ポーズによる自然な区切りが失われ、
+    # (1) 発話(turn)の総数が激減してフェーズ/意図タグ付けの粒度が粗くなる、
+    # (2) 長く話す話者は巨大な1発話、短い相槌の話者は細切れの発話多数になり、
+    #     話者ごとの発話時間の比較が歪む、という問題が実データで確認されたため。
+    diarization_turns = get_diarization_turns(diarization)
+
     all_turns = []
     current = None
     for seg in whisper_segments:
         for w in seg["words"]:
-            speaker = assign_speaker(w["start"], w["end"], diarization)
+            turn_index, speaker = assign_diarization_turn(w["start"], w["end"], diarization_turns)
             if speaker is None:
                 continue
-            if current and current["speaker"] == speaker:
+            if current and current["turn_index"] == turn_index:
                 current["text"] += w["word"]
                 current["end"] = w["end"]
             else:
                 if current:
                     all_turns.append(current)
-                current = {"speaker": speaker, "start": w["start"], "end": w["end"], "text": w["word"]}
+                current = {
+                    "turn_index": turn_index, "speaker": speaker,
+                    "start": w["start"], "end": w["end"], "text": w["word"]
+                }
     if current:
         all_turns.append(current)
 
@@ -564,6 +580,7 @@ def run_full_analysis(video_path):
         t["text"] = t["text"].strip()
         t["start"] = round(t["start"], 2)
         t["end"] = round(t["end"], 2)
+        del t["turn_index"]
     all_turns = [t for t in all_turns if t["text"]]
     all_turns.sort(key=lambda x: x['start'])
 
