@@ -472,12 +472,14 @@ def transcribe_full_audio(audio_path):
     一切見られない状態で短い断片を判断することになり、特に短い発話で誤認識
     (幻覚を含む)が増える原因になっていた。全体を1回で通すことで、Whisper
     本来の「前後の文脈を見て自然に補完する」強みを活かせるようにする。
-    話者ラベルは、この関数の戻り値の各セグメントの時間範囲を後段で
-    diarization結果と突き合わせて別途割り当てる。
+    話者ラベルは、この関数の戻り値の単語単位のタイムスタンプを後段で
+    diarization結果と突き合わせて別途割り当てる(セグメント単位で割り当てると、
+    1つのセグメントの中で話者が入れ替わった場合に全部が1人の話者に丸め込まれ、
+    話者分布が偏る問題が実データで確認されたため、単語単位まで細かくしている)。
 
     セグメント単位のフィルタ(no_speech_prob/avg_logprob、compression_ratio、
     既知の幻覚フレーズ)は変更なし。
-    戻り値: [{"start": ..., "end": ..., "text": ...}, ...]
+    戻り値: [{"start": ..., "end": ..., "text": ..., "words": [...]}, ...]
     """
     # temperature=0.0を単一値(タプルではなく)で渡すことで、貪欲デコードが品質基準
     # (avg_logprob/compression_ratio)を満たせなかった場合の温度フォールバック
@@ -485,7 +487,9 @@ def transcribe_full_audio(audio_path):
     # フォールバックがほぼ毎回発生し、実行のたびに全く異なる(時にはより長大で
     # 支離滅裂な)幻覚テキストを生成することが実データで確認されたため、
     # 決定的な貪欲デコード1回のみに固定する。
-    result = whisper_model.transcribe(audio_path, temperature=0.0)
+    # word_timestamps=Trueで単語単位のタイムスタンプも取得し、話者の切り替え
+    # 判定に使う。
+    result = whisper_model.transcribe(audio_path, temperature=0.0, word_timestamps=True)
     kept = []
     for seg in result.get("segments") or []:
         no_speech_prob = seg.get("no_speech_prob", 0.0)
@@ -499,15 +503,16 @@ def transcribe_full_audio(audio_path):
             continue
         if text.lower().strip(" .!?") in WHISPER_HALLUCINATION_PHRASES:
             continue
-        kept.append({"start": seg["start"], "end": seg["end"], "text": text})
+        words = seg.get("words") or [{"word": text, "start": seg["start"], "end": seg["end"]}]
+        kept.append({"start": seg["start"], "end": seg["end"], "text": text, "words": words})
     return kept
 
 
 def assign_speaker(seg_start, seg_end, diarization):
     """
-    Whisperのセグメント(seg_start〜seg_end)と最も重なりが大きいdiarizationの
-    話者区間を探し、その話者IDを返す。重なりが全く無い場合はNoneを返す
-    (無音の隙間などにできたセグメントは、どの話者の発話か判断できないため除外する)。
+    時間範囲(seg_start〜seg_end)と最も重なりが大きいdiarizationの話者区間を
+    探し、その話者IDを返す。重なりが全く無い場合はNoneを返す(無音の隙間などに
+    できたセグメントは、どの話者の発話か判断できないため除外する)。
     """
     best_speaker, best_overlap = None, 0.0
     for turn, _, speaker in diarization.itertracks(yield_label=True):
@@ -534,17 +539,32 @@ def run_full_analysis(video_path):
     full_audio.export(TEMP_SEGMENT_FILE, format="wav")
     whisper_segments = transcribe_full_audio(TEMP_SEGMENT_FILE)
 
+    # 単語単位でdiarizationと突き合わせ、話者が切り替わるたびに新しい発話(turn)を
+    # 作る。Whisperのセグメントの境界は話者の切れ目と一致しないことが多く、
+    # セグメント単位で話者を割り当てると、セグメント内で話者が入れ替わった分の
+    # 発言が丸ごと片方の話者に飲み込まれ、話者分布が偏る問題があったため。
     all_turns = []
+    current = None
     for seg in whisper_segments:
-        speaker = assign_speaker(seg["start"], seg["end"], diarization)
-        if speaker is None:
-            continue
-        all_turns.append({
-            "speaker": speaker,
-            "start": round(seg["start"], 2),
-            "end": round(seg["end"], 2),
-            "text": seg["text"]
-        })
+        for w in seg["words"]:
+            speaker = assign_speaker(w["start"], w["end"], diarization)
+            if speaker is None:
+                continue
+            if current and current["speaker"] == speaker:
+                current["text"] += w["word"]
+                current["end"] = w["end"]
+            else:
+                if current:
+                    all_turns.append(current)
+                current = {"speaker": speaker, "start": w["start"], "end": w["end"], "text": w["word"]}
+    if current:
+        all_turns.append(current)
+
+    for t in all_turns:
+        t["text"] = t["text"].strip()
+        t["start"] = round(t["start"], 2)
+        t["end"] = round(t["end"], 2)
+    all_turns = [t for t in all_turns if t["text"]]
     all_turns.sort(key=lambda x: x['start'])
 
     # C. メタデータ・要約判定
