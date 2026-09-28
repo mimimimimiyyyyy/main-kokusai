@@ -474,7 +474,13 @@ def transcribe_segment(audio_path):
     二段構えでフィルタする。
     戻り値: (文字起こしテキスト, 検出言語, 採用したセグメントの平均avg_logprob)
     """
-    result = whisper_model.transcribe(audio_path)
+    # temperature=0.0を単一値(タプルではなく)で渡すことで、貪欲デコードが品質基準
+    # (avg_logprob/compression_ratio)を満たせなかった場合の温度フォールバック
+    # (ランダムサンプリングでのリトライ)を無効化する。無音・ノイズ区間ではこの
+    # フォールバックがほぼ毎回発生し、実行のたびに全く異なる(時にはより長大で
+    # 支離滅裂な)幻覚テキストを生成することが実データで確認されたため、
+    # 決定的な貪欲デコード1回のみに固定する。
+    result = whisper_model.transcribe(audio_path, temperature=0.0)
     kept = []
     logprobs = []
     for seg in result.get("segments") or []:
