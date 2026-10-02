@@ -540,6 +540,26 @@ def assign_diarization_turn(t_start, t_end, diarization_turns):
     return best_index, best_speaker
 
 
+def print_speaker_distribution(label, entries):
+    """
+    話者ごとの発話回数・合計時間をログに出力する。entriesは
+    (start, end, speaker)のタプルのリスト(pyannoteの生の区間、または
+    最終的なall_turnsのどちらも同じ形で渡せる)。これを「pyannoteの生の
+    結果」と「Whisper+話者割り当てを経た最終結果」の両方について呼ぶことで、
+    話者分布の偏りがどちらの段階で生まれているかを1回の実行ログだけで
+    切り分けられるようにしている。
+    """
+    durations, counts = {}, {}
+    for start, end, speaker in entries:
+        durations[speaker] = durations.get(speaker, 0.0) + (end - start)
+        counts[speaker] = counts.get(speaker, 0) + 1
+    total = sum(durations.values()) or 1.0
+    print(f"--- 話者分布診断: {label} ---")
+    for speaker in sorted(durations):
+        pct = durations[speaker] / total * 100
+        print(f"  {speaker}: 発話回数={counts[speaker]}, 合計時間={durations[speaker]:.1f}秒 ({pct:.1f}%)")
+
+
 def run_full_analysis(video_path):
     # A. 音声変換
     full_audio = AudioSegment.from_file(video_path).set_frame_rate(16000).set_channels(1)
@@ -552,6 +572,12 @@ def run_full_analysis(video_path):
     # 話者ラベルを割り当てる。
     print("話者分離と文字起こしを実行中...")
     diarization = diarization_pipeline(audio_data_dict, num_speakers=TARGET_NUM_SPEAKERS)
+
+    # 診断用ログ: Whisperの単語割り当てを一切介さない、pyannote単体の生の
+    # 話者ごとの発話回数・合計時間。話者分布の偏りが、pyannoteの話者分離自体に
+    # 起因するのか、後段の単語割り当てロジックに起因するのかを切り分けるため、
+    # 毎回自動で出力するようにしている。
+    print_speaker_distribution("pyannote(生の話者分離結果)", get_diarization_turns(diarization))
 
     full_audio.export(TEMP_SEGMENT_FILE, format="wav")
     whisper_segments = transcribe_full_audio(TEMP_SEGMENT_FILE)
@@ -592,6 +618,11 @@ def run_full_analysis(video_path):
         del t["turn_index"]
     all_turns = [t for t in all_turns if t["text"]]
     all_turns.sort(key=lambda x: x['start'])
+
+    print_speaker_distribution(
+        "Whisper+話者割り当て後の最終結果",
+        [(t["start"], t["end"], t["speaker"]) for t in all_turns]
+    )
 
     # C. メタデータ・要約判定
     # summary/metadata/speaker_rolesは全体像の把握が目的なので冒頭サンプルで十分だが、
