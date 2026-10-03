@@ -527,12 +527,24 @@ def get_diarization_turns(diarization):
 
 def assign_diarization_turn(t_start, t_end, diarization_turns):
     """
-    時間範囲(t_start〜t_end)と最も重なりが大きいdiarizationの話者区間を探し、
-    (その区間のインデックス, 話者ID)を返す。重なりが全く無い場合は(None, None)。
+    時間範囲(t_start〜t_end、Whisperの単語1つ分)がどのdiarizationの話者区間に
+    属するかを判定し、(その区間のインデックス, 話者ID)を返す。
     区間のインデックスまで返すのは、後続処理で「話者が変わったら発話を区切る」
     のではなく「pyannoteが元々つけた発話区間が変わったら区切る」ようにするため
     （詳細はrun_full_analysis内のコメント参照）。
+
+    判定はまず単語の中心時刻を含む区間を優先する。重なりの絶対秒数で比較すると、
+    相槌のような短い発話(0.5秒未満など)は、隣接する長い発話の方が同じ単語との
+    重なり秒数が大きくなりやすく、常に負けて長い方の話者に飲み込まれてしまう
+    (実データで、ある話者の発話の95%が消失する現象として確認された)。
+    中心時刻を含む区間が無い場合(無音の隙間など)のみ、重なり最大の区間に
+    フォールバックする。
     """
+    midpoint = (t_start + t_end) / 2
+    for i, (turn_start, turn_end, speaker) in enumerate(diarization_turns):
+        if turn_start <= midpoint < turn_end:
+            return i, speaker
+
     best_index, best_speaker, best_overlap = None, None, 0.0
     for i, (turn_start, turn_end, speaker) in enumerate(diarization_turns):
         overlap = min(t_end, turn_end) - max(t_start, turn_start)
