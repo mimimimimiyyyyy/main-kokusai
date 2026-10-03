@@ -44,7 +44,12 @@ app.add_middleware(
 nest_asyncio.apply()
 client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
 
-TARGET_NUM_SPEAKERS = 4
+# num_speakersで人数を厳密指定すると、pyannoteがその人数に無理やり分類しようと
+# して、実際にはうまく分離できない場合に1〜2人のクラスタへ大半が吸収され、
+# 残りは断片的な誤検出になる現象が実データで確認された。min/max_speakersで
+# 範囲指定することで、pyannote自身に実際の人数判断の余地を与える。
+MIN_SPEAKERS = 2
+MAX_SPEAKERS = 4
 TEMP_SEGMENT_FILE = "temp_segment.wav"
 
 # jobs: /uploadを1回のHTTPリクエストで完結させず、ジョブID発行→バックグラウンド処理→
@@ -571,7 +576,7 @@ def run_full_analysis(video_path):
     # pyannoteの話者分離は別途実行して、あとでセグメントの時間範囲を突き合わせて
     # 話者ラベルを割り当てる。
     print("話者分離と文字起こしを実行中...")
-    diarization = diarization_pipeline(audio_data_dict, num_speakers=TARGET_NUM_SPEAKERS)
+    diarization = diarization_pipeline(audio_data_dict, min_speakers=MIN_SPEAKERS, max_speakers=MAX_SPEAKERS)
 
     # 診断用ログ: Whisperの単語割り当てを一切介さない、pyannote単体の生の
     # 話者ごとの発話回数・合計時間。話者分布の偏りが、pyannoteの話者分離自体に
