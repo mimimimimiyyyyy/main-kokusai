@@ -183,6 +183,24 @@ print("AIモデルをロード中...")
 diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 diarization_pipeline.to(device)
+
+# pyannoteの生の話者分離結果が特定の1話者に79%偏る現象が実データで確認された
+# (音量正規化を試しても変化なし)。クラスタリングの閾値(threshold)が高いと、
+# 声質が近い複数人の発話が1つのクラスタに統合されすぎる可能性があるため、
+# モデルが持つデフォルト値を実際に読み取り、それより厳しい(低い)閾値で
+# 再インスタンス化して、別の話者と判定されやすくなるか試す。
+_default_params = diarization_pipeline.parameters(instantiated=True)
+print("pyannote診断: デフォルトパラメータ =", _default_params)
+_clustering_params = dict(_default_params.get("clustering", {}))
+_default_threshold = _clustering_params.get("threshold")
+if _default_threshold is not None:
+    _clustering_params["threshold"] = _default_threshold * 0.85
+    diarization_pipeline.instantiate({**_default_params, "clustering": _clustering_params})
+    print(
+        f"pyannote診断: clustering.thresholdを{_default_threshold:.4f} "
+        f"→ {_clustering_params['threshold']:.4f}に変更"
+    )
+
 whisper_model = whisper.load_model("medium", device=device)
 warnings.filterwarnings("ignore")
 
