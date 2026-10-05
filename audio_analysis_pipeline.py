@@ -23,7 +23,7 @@ from torch.torch_version import TorchVersion
 from pyannote.audio.core.task import Specifications, Problem, Resolution
 torch.serialization.add_safe_globals([TorchVersion, Specifications, Problem, Resolution])
 
-from pydub import AudioSegment
+from pydub import AudioSegment, effects as audio_effects
 from pyannote.audio import Pipeline
 from google.colab import userdata
 from fastapi import FastAPI, UploadFile, File
@@ -577,7 +577,13 @@ def print_speaker_distribution(label, entries):
 
 def run_full_analysis(video_path):
     # A. 音声変換
+    # 話者ごとにマイクとの距離や声の大きさが違うと、pyannoteの音声区間検出(VAD)が
+    # 声が小さい話者の発話を無音と誤判定したり、話者埋め込みの精度が落ちたりして、
+    # 話者分離の結果が特定の話者に偏る一因になる(実データで、pyannote自体の生の
+    # 結果ですでに1話者が79%を占める偏りが確認された)。音量を正規化してから
+    # 話者分離・文字起こしに渡すことで、この偏りを軽減できるか試す。
     full_audio = AudioSegment.from_file(video_path).set_frame_rate(16000).set_channels(1)
+    full_audio = audio_effects.normalize(full_audio)
     samples = np.array(full_audio.get_array_of_samples()).astype(np.float32) / 32768.0
     audio_data_dict = {'waveform': torch.tensor(samples).unsqueeze(0), 'sample_rate': 16000}
 
