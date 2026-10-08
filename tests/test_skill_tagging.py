@@ -55,9 +55,21 @@ def test_fuzzy_match_above_threshold(skill, tags):
 
 
 def test_fuzzy_match_respects_threshold(skill, tags):
-    assert matched_name(skill, "レーザー墨出器", tags, threshold=99) is None
-    assert matched_name(skill, "コンクリート", tags) is None  # 「コンクリート打設」より広い意味の言葉
-    assert matched_name(skill, "型枠解体工", tags) is None    # 一方が他方を丸ごと含む言葉は類似度では一致させない
+    assert matched_name(skill, "コンクリ―ト打説", tags, threshold=99) is None
+    assert matched_name(skill, "コンクリート", tags) is None  # 「コンクリート打設」より広い意味の言葉は一致させない
+    assert matched_name(skill, "墨", tags) is None            # 1文字の言葉も一致させない
+
+
+def test_word_containing_tag_name_matches_most_specific_tag(skill, tags):
+    # 話し言葉の「型枠の建て込み」には「型枠」（型枠工事の別名）と「建て込み」（型枠組立の別名）が入っている
+    assert matched_name(skill, "型枠の建て込み", tags) == ("型枠組立", "partial")
+    assert matched_name(skill, "インパクトで締める", tags) == ("インパクトドライバー", "partial")
+    assert matched_name(skill, "型枠解体工", tags)[0] == "型枠解体"
+
+
+def test_similarity_is_checked_before_containment(skill, tags):
+    # 「石膏ボード」（資材）を含むが、文字列全体は作業の「石膏ボード張り」（ボード張りの別名）に近い
+    assert matched_name(skill, "石膏ボードはり", tags) == ("ボード張り", "fuzzy")
 
 
 def test_difficulty_tags_are_not_matched_from_words(skill, tags):

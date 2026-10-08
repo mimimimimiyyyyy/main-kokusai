@@ -914,8 +914,9 @@ h1 { font-size: 18pt; margin: 0 0 4px; border-bottom: 3px solid #e67e00; padding
 .step-head { background: #fff3e0; padding: 5px 10px; font-weight: bold; font-size: 12pt; }
 .step-head .time { float: right; font-weight: normal; font-size: 9.5pt; color: #555; }
 .step-body { display: flex; gap: 10px; padding: 8px 10px; }
-.photo { width: 62mm; flex: none; }
-.photo img { width: 100%; border: 1px solid #ccc; }
+.photo { width: 62mm; flex: none; text-align: center; }
+/* スマホで縦向きに撮った動画でも写真が大きくなりすぎないよう、高さにも上限を付ける */
+.photo img { max-width: 100%; max-height: 55mm; border: 1px solid #ccc; }
 .text { flex: 1; }
 .label { display: inline-block; font-weight: bold; min-width: 4.5em; }
 .caution { color: #b00020; }
@@ -1076,7 +1077,8 @@ def normalize_term(text):
 
 def match_tag(word, tags, threshold=SKILL_TAG_FUZZY_THRESHOLD):
     """
-    ③ の2: タグ一覧と照合する。完全一致（名前）→ 別名一致 → 文字列の類似度が閾値以上、の順。
+    ③ の2: タグ一覧と照合する。完全一致（名前）→ 別名一致 → 文字列の類似度が閾値以上 →
+    言葉の中に名前・別名が入っている、の順。
     難易度タグは言葉からは付けない。見つからなければ None。
     """
     key = normalize_term(word)
@@ -1089,13 +1091,33 @@ def match_tag(word, tags, threshold=SKILL_TAG_FUZZY_THRESHOLD):
     for tag in candidates:
         if key in (normalize_term(a) for a in tag["aliases"]):
             return {"tag": tag, "method": "alias", "score": 100.0}
-    # 類似度は表記ゆれ（送り仮名・誤認識など）を拾うためのもの。一方がもう一方を丸ごと
-    # 含む言葉（コンクリート／コンクリート打設）は意味の広さが違うので、ここでは一致させない。
+    # 表記ゆれ（送り仮名・誤認識など）は、文字列全体の類似度で比べる。言葉の方が短く、
+    # タグ名に含まれるだけの場合（コンクリート ⊂ コンクリート打設）は意味が広いので一致させない。
     best = None
     for tag in candidates:
         for name in [tag["name"]] + tag["aliases"]:
             other = normalize_term(name)
-            if key in other or other in key:
+            if key in other:
+                continue
+            score = fuzz.ratio(key, other)
+            if score >= threshold and (best is None or score > best["score"]):
+                best = {"tag": tag, "method": "fuzzy", "score": round(score, 1)}
+    if best:
+        return best
+    # 最後に、言葉の中にタグの名前・別名がそのまま入っている場合（型枠の建て込み ⊃ 建て込み）は、
+    # より詳しい言い方なので、そのタグとみなす。複数入っていれば一番長い（具体的な）名前を採る
+    # （「型枠」より「建て込み」）。
+    best_len = 0
+    for tag in candidates:
+        for name in [tag["name"]] + tag["aliases"]:
+            other = normalize_term(name)
+            if len(other) >= 2 and other in key and len(other) > best_len:
+                best, best_len = {"tag": tag, "method": "partial", "score": 100.0}, len(other)
+    return best
+    for tag in candidates:
+        for name in [tag["name"]] + tag["aliases"]:
+            other = normalize_term(name)
+            if key in other:
                 continue
             score = fuzz.ratio(key, other)
             if score >= threshold and (best is None or score > best["score"]):
