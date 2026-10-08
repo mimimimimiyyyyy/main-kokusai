@@ -61,11 +61,11 @@ CLAUDE.md「作業0」の成果物。コードはまだ書いていない。
 | 匿名化 | `extract_mask_targets_with_gpt()` で固有名詞を `[MASK]` 置換 | 使うかどうか要判断（Q5） |
 | 発話ラベル付け | `tag_turns_with_gpt()`（phase / intent） | 使わない（対話研究用のラベル体系） |
 | 要約・メタデータ | `run_full_analysis()` 内の GPT-4o 呼び出し | 使わない（手順書生成で代替） |
-| 埋め込み・意味検索 | `POST /search`（全セッションの turns を横断してコサイン類似度） | MVP では使わない。ただし技能伝承の動画が混ざると研究用の検索結果が変わる（Q1） |
-| 一覧・詳細取得 | `GET /corpus`, `GET /corpus/{id}`, `GET /corpus/{id}/raw_turns` | 詳細取得の考え方は流用。一覧は技能伝承が混ざらないよう配慮が必要（Q1） |
+| 埋め込み・意味検索 | `POST /search`（全セッションの turns を横断してコサイン類似度） | 使わない。技能伝承は別の表に保存するので、研究用の検索結果は変わらない（Q1＝B 案） |
+| 一覧・詳細取得 | `GET /corpus`, `GET /corpus/{id}`, `GET /corpus/{id}/raw_turns` | API の形（一覧／詳細／`raw_turns` 相当）を真似る。既存の一覧には技能伝承は出ない（Q1＝B 案） |
 | 版つき再分析 | `POST /corpus/{id}/retag`, `/addin` | **考え方を流用**（手順書・タグ付けの再実行時に `method_version` を残す） |
 | 時間区間テキストの読み込み | `transcription_accuracy_tool.py` の `parse_reference_file()`（`00:00:00.000 --> ...` 形式） | WebVTT と同じ時刻表記。字幕の出力形式を揃える参考にする |
-| 精度評価（WER/CER） | `transcription_accuracy_tool.py` | 技能伝承の文字起こしも `turns` に入れれば、**騒音下での認識精度を同じツールで評価できる**（研究上の利点） |
+| 精度評価（WER/CER） | `transcription_accuracy_tool.py` | 技能伝承は別の表なので、そのままでは使えない（Q1＝B 案を選んだことによる制約。必要になれば別途対応） |
 | エクスポート | グラフ PNG（base64）、精度レポート CSV | 字幕（WebVTT）・PDF は新規 |
 
 ---
@@ -74,30 +74,33 @@ CLAUDE.md「作業0」の成果物。コードはまだ書いていない。
 
 | 技能伝承での概念 | 想定 | 調査結果 | 方針 |
 | --- | --- | --- | --- |
-| 作業動画 | 対話セッション＋メディアファイル | `sessions` はあるが、メディアファイル管理は無い | **流用＋新規**：`sessions` に 1 行作り、動画ファイル・処理状態は新テーブル `skill_videos` で持つ |
-| 説明者（熟練者） | 話者・参加者 | 話者テーブルは無い。`turns.speaker` の文字列のみ | **流用**：`turns.speaker` に説明者名（未入力なら `SPEAKER_00`）を入れる。話者分離はしない |
-| 文字起こしセグメント（開始・終了時間付き） | 発話・書き起こし | `turns`（start / end / text）がそのまま使える | **流用**：`turns` に保存（phase / intent / embedding は NULL） |
-| 字幕 | 書き起こしの時間情報から生成 | 生成処理は無い | **新規**：`turns` から WebVTT を生成（保存せず毎回生成、またはファイル保存） |
-| 手順（時間帯つき） | 区間アノテーション | 区間アノテーションは無い（ラベルは発話単位のみ） | **新規**：汎用の区間アノテーション表 `segment_annotations` を作り、`layer='skill_step'` で保存 |
+| 作業動画 | 対話セッション＋メディアファイル | `sessions` はあるが、メディアファイル管理は無い | **新規（`sessions` を手本に）**：`skill_videos` に動画情報・動画ファイル・処理状態を持つ。`sessions` には入れない |
+| 説明者（熟練者） | 話者・参加者 | 話者テーブルは無い。`turns.speaker` の文字列のみ | **同じ形で新規**：`skill_segments.speaker` に説明者名（未入力なら `SPEAKER_00`）。話者分離はしない |
+| 文字起こしセグメント（開始・終了時間付き） | 発話・書き起こし | `turns`（start / end / text） | **同じ形で新規**：`turns` と同じ列構成の `skill_segments` に保存 |
+| 字幕 | 書き起こしの時間情報から生成 | 生成処理は無い | **新規**：`skill_segments` から WebVTT を生成 |
+| 手順（時間帯つき） | 区間アノテーション | 区間アノテーションは無い（ラベルは発話単位のみ） | **新規**：区間アノテーション表 `skill_annotations` を作り、`layer='step'` で保存 |
 | タグ一覧（タグマスタ） | ラベルの定義・ラベルセット | ラベル定義は無い（コード中の定数） | **新規**：`skill_tags`（名前・分類・親・別名） |
-| 動画タグ／場面タグ | セッション単位／区間単位のアノテーション | どちらも無い | **新規**：`segment_annotations` の `layer='skill_scene_tag'`（時間あり）／`'skill_video_tag'`（時間なし＝セッション単位） |
+| 動画タグ／場面タグ | セッション単位／区間単位のアノテーション | どちらも無い | **新規**：`skill_annotations` の `layer='scene_tag'`（時間あり）／`'video_tag'`（時間なし＝動画単位） |
 | 新タグ候補 | — | 無い | **新規**：`skill_tag_candidates` |
 | タグでの絞り込み | 既存の検索・フィルタ | 既存は埋め込みによる意味検索のみ。タグ・分類での絞り込みは無い | **新規**：AND 絞り込み・分類の下位を含む一覧の API |
-| 手順書 | 新規（LLM → PDF） | — | **新規**。LLM 結果の原本は `addin_results`（`addin_name='skill_procedure'`, 版つき）にも残す＝既存の再分析の考え方を流用 |
+| 手順書 | 新規（LLM → PDF） | — | **新規**。LLM 結果の原本は `addin_results` と同じ形の `skill_llm_results`（版つき）に残す＝既存の再分析の考え方を流用 |
 | 処理状況・再実行 | — | メモリ上の `jobs` のみ | **流用＋拡張**：進捗表示は既存 `jobs`/`/jobs/{id}` を共用、失敗状態とエラーは `skill_videos` に永続化して再実行可能にする |
 
 ---
 
 ## 5. 実装計画
 
-### 5.1 追加するテーブル（既存テーブルは原則そのまま）
+### 5.1 追加するテーブル（既存テーブルには一切触れない＝Q1 は B 案）
+
+同じ `corpus.db` に、`skill_` で始まる表だけを追加する。既存の 5 つの表・既存 API の SQL は変更しないので、研究用の一覧・検索・精度ツールの結果は今と同じ。
 
 ```sql
--- 作業動画（sessions 1 行に対応）。メディアファイルと処理状態を持つ
+-- 作業動画（sessions に相当）。動画ファイルと処理状態も持つ
 CREATE TABLE IF NOT EXISTS skill_videos (
-    session_id   INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     title        TEXT,
     explainer    TEXT,
+    filename     TEXT,      -- アップロード時の元のファイル名
     media_path   TEXT,      -- 保存した動画（再生用）
     duration     REAL,
     status       TEXT,      -- uploaded / transcribing / transcribed / procedure / tagging / done / error
@@ -106,25 +109,46 @@ CREATE TABLE IF NOT EXISTS skill_videos (
     vtt_path     TEXT,
     pdf_path     TEXT,
     created      TEXT,
-    updated      TEXT,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
+    updated      TEXT
 );
 
--- 区間アノテーション（汎用。layer で種類を分ける。start/end が NULL ならセッション単位）
-CREATE TABLE IF NOT EXISTS segment_annotations (
+-- 文字起こしセグメント（turns と同じ列構成。研究用の phase/intent/role/embedding は持たない）
+CREATE TABLE IF NOT EXISTS skill_segments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id   INTEGER,
+    speaker    TEXT,
+    start      REAL,
+    end        REAL,
+    text       TEXT,
+    FOREIGN KEY (video_id) REFERENCES skill_videos(id)
+);
+
+-- 区間アノテーション（layer で種類を分ける。start/end が NULL なら動画単位）
+CREATE TABLE IF NOT EXISTS skill_annotations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id     INTEGER,
-    layer          TEXT,    -- 'skill_step' / 'skill_scene_tag' / 'skill_video_tag'
+    video_id       INTEGER,
+    layer          TEXT,    -- 'step' / 'scene_tag' / 'video_tag'
     start          REAL,
     end            REAL,
     label          TEXT,    -- 手順タイトル、タグ名など
     tag_id         INTEGER, -- タグのとき skill_tags.id
-    parent_id      INTEGER, -- 場面タグ → 手順（segment_annotations.id）
-    payload        TEXT,    -- JSON（手順の説明・道具・資材・注意点など）
+    parent_id      INTEGER, -- 場面タグ → 手順（skill_annotations.id）
+    payload        TEXT,    -- JSON（手順の説明・道具・資材・注意点・写真など）
     source         TEXT,    -- 'llm' / 'human'
     method_version TEXT,
     created        TEXT,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
+    FOREIGN KEY (video_id) REFERENCES skill_videos(id)
+);
+
+-- LLM の生の結果（addin_results と同じ考え方。手順分割・タグ抽出をやり直しても上書きせず版で残す）
+CREATE TABLE IF NOT EXISTS skill_llm_results (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id       INTEGER,
+    kind           TEXT,    -- 'procedure' / 'tag_terms'
+    method_version TEXT,
+    created        TEXT,
+    result         TEXT,
+    FOREIGN KEY (video_id) REFERENCES skill_videos(id)
 );
 
 -- タグマスタ（作業の種類は category='作業' の階層として表す）
@@ -140,7 +164,7 @@ CREATE TABLE IF NOT EXISTS skill_tags (
 -- 新タグ候補（自動登録はしない。管理画面で採用／却下）
 CREATE TABLE IF NOT EXISTS skill_tag_candidates (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER,
+    video_id   INTEGER,
     word       TEXT,
     category   TEXT,
     status     TEXT,         -- pending / adopted / rejected
@@ -148,7 +172,7 @@ CREATE TABLE IF NOT EXISTS skill_tag_candidates (
 );
 ```
 
-`segment_annotations` は技能伝承専用にせず汎用の名前にしておく。対話研究でも「発話をまたぐ区間ラベル」が必要になったときに同じ表を使える。
+既存の表の書き方（`id INTEGER PRIMARY KEY AUTOINCREMENT`、`created TEXT`、JSON は TEXT 列）に合わせる。
 
 ### 5.2 ファイル構成と Colab での動かし方
 
@@ -195,15 +219,15 @@ if "register_skill_transfer" in globals():
 
 | 区分 | 内容 |
 | --- | --- |
-| 流用 | `sessions`・`turns`（記録単位・時間付き書き起こし）、`transcribe_full_audio()`、pydub による音声変換・正規化、ジョブ ID＋ポーリング方式と `jobs`/`/jobs/{id}`、`addin_results`（LLM 生出力の版つき保存）、OpenAI クライアント（Q2 次第）、pydantic、FastAPI の `app`、`transcription_accuracy_tool.py`（技能伝承動画の認識精度評価にそのまま使える） |
-| 拡張 | `audio_analysis_pipeline.py` のサーバー起動直前に登録の数行を追加（5.2）。Q1 で A 案の場合は `sessions` に `domain` 列を追加し、`/corpus`・`/search`・精度ツールの「最新セッション」取得で対話研究分だけを対象にする（Q6 は任意） |
-| 新規 | `skill_transfer_cell.py`・`skill_transfer.html`、上記 4 テーブル、騒音除去、文分割、WebVTT、LLM 呼び出しの集約、手順分割＋検証＋再試行、PDF、タグ照合（rapidfuzz）、タグ絞り込み API、動画ファイル配信、画面一式、seed CSV、pytest、`.env.example`、README |
+| 流用 | `sessions`・`turns`・`addin_results` の列構成（新しい表の手本）、`transcribe_full_audio()`、pydub による音声変換・正規化、ジョブ ID＋ポーリング方式と `jobs`/`/jobs/{id}`、OpenAI クライアント（Q2 次第）、pydantic、FastAPI の `app` |
+| 拡張 | `audio_analysis_pipeline.py` のサーバー起動直前に登録の数行を追加（5.2）。既存の表・既存 API は変更しない（Q1＝B 案）。Q6 は任意 |
+| 新規 | `skill_transfer_cell.py`・`skill_transfer.html`、上記 6 テーブル、騒音除去、文分割、WebVTT、LLM 呼び出しの集約、手順分割＋検証＋再試行、PDF、タグ照合（rapidfuzz）、タグ絞り込み API、動画ファイル配信、画面一式、seed CSV、pytest、`.env.example`、README |
 
 ### 5.4 各段階の作業とテスト
 
 | 段階 | 作業 | テスト（すべて pytest、一時 SQLite、LLM・音声認識はモック） |
 | --- | --- | --- |
-| 1 | 4 テーブル作成（＋Q1 の列追加）、seed CSV と投入処理 | テーブル作成が冪等であること、既存テーブルの列が変わらないこと、CSV の親子・別名が正しく入ること、再投入で重複しないこと |
+| 1 | 6 テーブル作成、seed CSV と投入処理 | テーブル作成が冪等であること、既存の表に変更が無いこと、CSV の親子・別名が正しく入ること、再投入で重複しないこと |
 | 2 | アップロード API（`/skill/upload`）、動画保存、音声取り出し・騒音除去、文分割→`turns` 保存、WebVTT | 文分割と時刻、1 行 N 文字×最大 2 行での区切り、文字数比例の時間配分、VTT の書式、失敗時に `status=error` とエラー内容が残り再実行できること |
 | 3 | LLM で手順分割（固定スキーマ JSON・検証・1 回だけ再試行）、セグメント番号→時間の決定、区間アノテーション保存、各手順の代表フレームを ffmpeg で静止画に切り出し、写真付き PDF | 正常系、不正 JSON → 再試行成功／再試行も失敗で error、時間がセグメントから決まること、PDF が生成されること（WeasyPrint が無い環境ではスキップ表示） |
 | 4 | 用語抽出、完全一致→別名一致→類似度の順で照合、新タグ候補、場面タグ、難易度（設定で ON/OFF）、動画タグ集約 | 照合の優先順位と閾値、候補が自動登録されないこと、場面タグの時間が手順と一致、動画タグ＝場面タグの和集合 |
@@ -238,13 +262,9 @@ CLAUDE.md と方針資料を突き合わせ、計画に次の点を反映・確�
 
 ## 6. 判断が必要な点（確認をお願いします）
 
-**Q1. 技能伝承の動画を既存の `sessions`/`turns` に入れるか**
-
-- **A 案（推奨）**：`sessions`/`turns` に入れ、`sessions` に `domain TEXT DEFAULT 'dialogue'` 列を追加（既存行は自動で `'dialogue'`）。
-  `/corpus` 一覧・`/search`・精度ツールの「最新セッション」取得に `domain='dialogue'` の条件を足し、**対話研究側の出力は今と同じに保つ**。
-  - 利点：データモデルを本当に流用できる。`raw_turns`・正解書き起こし・精度ツールが技能伝承動画にもそのまま使える
-  - 影響：既存テーブル 1 つに列追加、既存 API 3 か所の SQL に条件追加（＝CLAUDE.md の「既存の変更」に当たるため確認が必要）
-- **B 案**：既存テーブルには一切触れず、技能伝承用に独立した表（動画・セグメント）を作る。既存への影響はゼロだが、`turns` と同じ構造を二重に持つことになり、精度ツールも使えない。
+**Q1. 技能伝承の動画を既存の `sessions`/`turns` に入れるか** → **回答済み：B 案（別の表）**。
+既存の表・既存 API には触れず、`skill_` で始まる表を新しく作る（5.1）。研究用の一覧・検索・精度ツールには技能伝承の動画は出てこない。
+その代わり、精度ツール（WER/CER）は技能伝承の文字起こしには使えない。
 
 **Q2. LLM はどれを使うか**
 既存は OpenAI `gpt-4o`。CLAUDE.md の「既存にあるものが優先」に従うと OpenAI になる。
