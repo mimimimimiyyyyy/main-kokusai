@@ -18,14 +18,14 @@ CLAUDE.md「作業0」の成果物。コードはまだ書いていない。
 | 音声認識 | openai-whisper `medium`（faster-whisper ではない）。幻覚除去フィルタつき | `audio_analysis_pipeline.py:204, 467-538` |
 | LLM | OpenAI `gpt-4o`（JSON モード）、埋め込みは `text-embedding-3-small` | `audio_analysis_pipeline.py:45, 284-289, 724-725` |
 | 秘密情報 | `google.colab.userdata`（Colab のシークレット）。`.env` は無い | `audio_analysis_pipeline.py:45, 1227` |
-| フロントエンド | **リポジトリ内には無い**。CORS 全許可と ngrok の案内文から、別の場所にある画面から API を呼んでいると推測 | — |
-| 起動方法 | Colab で `audio_analysis_pipeline.py` をセルとして実行 → 表示された ngrok URL を開く | `audio_analysis_pipeline.py:1219-1245` |
+| フロントエンド | リポジトリ外の単一 HTML ファイル `kokusai.html`（提供いただいたもの）。CSS・JavaScript をファイル内に直書き、ライブラリ・ビルド無し、`const BASE_URL`（ngrok URL を貼る）へ `fetch`、ヘッダ `ngrok-skip-browser-warning` を付与、アップロード後は `/jobs/{id}` を 3 秒ごとにポーリング。VS Code の配色変数を使っており PC で開く前提 | `kokusai.html` |
+| 起動方法 | Colab のセルに `audio_analysis_pipeline.py` を貼って実行 → 表示された ngrok URL を `kokusai.html` の `BASE_URL` に貼る（精度ツールは別セル） | `audio_analysis_pipeline.py:1219-1245` |
 | テスト | **無い**（テストフレームワーク・`tests/`・CI いずれも無し）。`transcription_accuracy_tool.py` は文字起こし精度（WER/CER）を測る研究用ツールで、ソフトウェアのテストではない | — |
 | 依存関係の管理 | `requirements.txt` などは無く、セル冒頭の `!pip install` のみ | — |
 | その他 | `README`、`.env.example`、`seed/` も無い | — |
 
 **重要な制約**：両ファイルとも Colab セル専用の書き方（`!` コマンド、トップレベル `await`、import 時にモデル読み込み・Drive の DB 接続・サーバー起動）のため、**普通の Python モジュールとして import できない**。
-そのため、既存コードをそのまま単体テストから呼ぶことはできない（後述の「判断が必要な点」Q4）。
+そのため、既存コードをそのまま単体テストから呼ぶことはできない（テストの方法は 5.2 参照）。
 
 ---
 
@@ -150,51 +150,54 @@ CREATE TABLE IF NOT EXISTS skill_tag_candidates (
 
 `segment_annotations` は技能伝承専用にせず汎用の名前にしておく。対話研究でも「発話をまたぐ区間ラベル」が必要になったときに同じ表を使える。
 
-### 5.2 ディレクトリ構成（案）
+### 5.2 ファイル構成と Colab での動かし方
+
+既存の運用（Colab はセルに貼り付け、画面は単一 HTML）に合わせる。
 
 ```
-skill_transfer/              # 新規パッケージ（Colab 非依存・import 可能・単体テスト可能）
-  __init__.py
-  config.py                  # 環境変数の読み込み（N文字、閾値、保存先、LLM 設定など）
-  db.py                      # 上記テーブルの作成・保存・取得（conn を引数で受け取る）
-  seed.py                    # seed/skill_transfer_tags.csv の投入
-  audio.py                   # 音声取り出し（pydub）＋騒音除去（noisereduce）
-  transcribe.py              # ① 文分割・turns 保存（認識関数は引数で注入）
-  subtitles.py               # ① WebVTT 生成
-  llm.py                     # LLM 呼び出しを 1 か所に集約（差し替え可能）
-  procedure.py               # ② 手順分割・スキーマ検証・再試行・区間アノテーション保存
-  procedure_pdf.py           # ② HTML テンプレート → PDF（WeasyPrint）
-  templates/procedure.html
-  tagging.py                 # ③ 抽出・照合（rapidfuzz）・場面タグ・動画タグ・難易度
-  pipeline.py                # ①②③ を順に実行、状態の記録と失敗段階からの再実行
-  api.py                     # FastAPI の APIRouter（/skill/...）
-  static/                    # 画面（スマホ優先、HTML + 素の JavaScript）
-seed/skill_transfer_tags.csv
-tests/                       # pytest。LLM・音声認識はモック
+skill_transfer_cell.py       # 新しい Colab セル（技能伝承の処理と API を 1 ファイルに。精度ツールと同じ「別セル」形式）
+skill_transfer.html          # 新しい画面（kokusai.html と同じ書き方：単一ファイル、CSS/JS 直書き、ライブラリ無し）
+seed/skill_transfer_tags.csv # タグ一覧の初期データ
+tests/                       # pytest（新規導入）。LLM・音声認識はモック
+  conftest.py                # セルファイルを読み込むローダー（後述）
 .env.example
 README.md
 ```
 
-既存の 2 ファイルと同様に Colab で動かすため、`audio_analysis_pipeline.py` の「5. サーバー起動」の直前に **数行だけ追加** し、
-既存の `app`・`conn`・`jobs`・`transcribe_full_audio`・`client` を渡して技能伝承のルーターを登録する（既存の処理・API には手を入れない）。
+**Colab での実行順**（既存セルの中身はほぼそのまま）
+
+1. `skill_transfer_cell.py` を貼ったセルを実行（関数と設定の定義だけ。モデル読み込みやサーバー起動はしない）
+2. 既存の `audio_analysis_pipeline.py` のセルを実行
+
+既存セルの「5. サーバー起動」の直前に、次の **数行だけを追加** する。技能伝承セルを実行していなければ何もしないので、**今までどおり既存セルだけを動かしたときの動作は変わらない**。
 
 ```python
-# --- 4.5 技能伝承機能 ---（追加イメージ）
-import sys; sys.path.insert(0, SKILL_TRANSFER_REPO_DIR)
-from skill_transfer.api import create_router
-app.include_router(create_router(conn=conn, jobs=jobs, jobs_lock=jobs_lock,
-                                 transcribe_fn=transcribe_full_audio, openai_client=client))
+# --- 4.5 技能伝承機能（skill_transfer_cell.py を先に実行した場合のみ有効） ---
+if "register_skill_transfer" in globals():
+    register_skill_transfer(app, conn, jobs, jobs_lock,
+                            transcribe_fn=transcribe_full_audio, openai_client=client)
 ```
 
-既存関数を引数で注入する形にすることで、**既存の Whisper 設定・幻覚フィルタをそのまま使いつつ、テストではモックに差し替えられる**。
+既存のサーバー起動はセルの最後で処理が止まる（`await server.serve()`）ため、後から別セルで API を足すことができない。そのため「技能伝承セルを先に実行し、既存セルの最後で登録する」順にしている。
+既存の Whisper 設定・幻覚フィルタ（`transcribe_full_audio`）や OpenAI クライアントは引数で受け取るので、そのまま使いつつ、テストではモックに差し替えられる。
+
+**画面の配信**：`kokusai.html` のようにファイルを開いて ngrok URL に `fetch` する方式は、スマホでは HTML ファイルを開く手段が無いうえ、`<video>` タグには `ngrok-skip-browser-warning` ヘッダを付けられず ngrok の警告ページで再生が止まる。
+そのため `skill_transfer.html` は書き方を `kokusai.html` に揃えたうえで、**FastAPI から `/skill` で配信**し、スマホでは「ngrok URL/skill」を開く（初回だけ「Visit Site」を押せば以後は動画も再生できる）。
+`BASE_URL` は既定で配信元（`location.origin`）を使い、`kokusai.html` と同じく PC でファイルを直接開いて URL を貼る使い方もできるようにする。HTML ファイルは Drive（`SKILL_MEDIA_DIR` と同じ場所）に置き、セルからそのパスを読む。
+
+**テストの方法**：セルファイルは `!pip install` 行があるため、そのままは import できない。`tests/conftest.py` に「`!` で始まる行を除いて読み込むローダー」を用意し、
+- `skill_transfer_cell.py`：そのまま読み込んでテスト（重い処理は引数で注入するため、スタブは LLM・音声認識だけ）
+- `audio_analysis_pipeline.py`（既存 API の回帰確認）：同じローダーで、torch・whisper・pyannote・colab などをスタブにし、DB パスを一時ファイルに置き換え、「5. サーバー起動」以降を除いて読み込む。`/corpus`・`/search` などが技能伝承の追加前と同じ結果を返すことを確かめる
+
+この方法なら、テストのために既存コードを書き換える必要はない（前回提案した `CORPUS_DB_PATH` の変更は取り下げる）。
 
 ### 5.3 流用／拡張／新規の一覧
 
 | 区分 | 内容 |
 | --- | --- |
 | 流用 | `sessions`・`turns`（記録単位・時間付き書き起こし）、`transcribe_full_audio()`、pydub による音声変換・正規化、ジョブ ID＋ポーリング方式と `jobs`/`/jobs/{id}`、`addin_results`（LLM 生出力の版つき保存）、OpenAI クライアント（Q2 次第）、pydantic、FastAPI の `app`、`transcription_accuracy_tool.py`（技能伝承動画の認識精度評価にそのまま使える） |
-| 拡張 | `audio_analysis_pipeline.py` にルーター登録の数行を追加。Q1 で A 案の場合は `sessions` に `domain` 列を追加し、`/corpus`・`/search`・精度ツールの「最新セッション」取得で対話研究分だけを対象にする（Q6 は任意） |
-| 新規 | 上記 4 テーブル、騒音除去、文分割、WebVTT、LLM 呼び出しの集約、手順分割＋検証＋再試行、PDF、タグ照合（rapidfuzz）、タグ絞り込み API、動画ファイル配信、画面一式、seed CSV、pytest、`.env.example`、README |
+| 拡張 | `audio_analysis_pipeline.py` のサーバー起動直前に登録の数行を追加（5.2）。Q1 で A 案の場合は `sessions` に `domain` 列を追加し、`/corpus`・`/search`・精度ツールの「最新セッション」取得で対話研究分だけを対象にする（Q6 は任意） |
+| 新規 | `skill_transfer_cell.py`・`skill_transfer.html`、上記 4 テーブル、騒音除去、文分割、WebVTT、LLM 呼び出しの集約、手順分割＋検証＋再試行、PDF、タグ照合（rapidfuzz）、タグ絞り込み API、動画ファイル配信、画面一式、seed CSV、pytest、`.env.example`、README |
 
 ### 5.4 各段階の作業とテスト
 
@@ -204,11 +207,11 @@ app.include_router(create_router(conn=conn, jobs=jobs, jobs_lock=jobs_lock,
 | 2 | アップロード API（`/skill/upload`）、動画保存、音声取り出し・騒音除去、文分割→`turns` 保存、WebVTT | 文分割と時刻、1 行 N 文字×最大 2 行での区切り、文字数比例の時間配分、VTT の書式、失敗時に `status=error` とエラー内容が残り再実行できること |
 | 3 | LLM で手順分割（固定スキーマ JSON・検証・1 回だけ再試行）、セグメント番号→時間の決定、区間アノテーション保存、各手順の代表フレームを ffmpeg で静止画に切り出し、写真付き PDF | 正常系、不正 JSON → 再試行成功／再試行も失敗で error、時間がセグメントから決まること、PDF が生成されること（WeasyPrint が無い環境ではスキップ表示） |
 | 4 | 用語抽出、完全一致→別名一致→類似度の順で照合、新タグ候補、場面タグ、難易度（設定で ON/OFF）、動画タグ集約 | 照合の優先順位と閾値、候補が自動登録されないこと、場面タグの時間が手順と一致、動画タグ＝場面タグの和集合 |
-| 5 | 画面：アップロード（`capture="environment"`、処理状況表示）、再生（字幕 ON/OFF、場面タグ一覧で頭出し、再生バーに印、PDF ダウンロード）、動画配信（Range 対応） | API のテスト（TestClient）。画面は Playwright（環境にある Chromium）でスマホ幅の表示確認 |
+| 5 | 画面（`skill_transfer.html`、`/skill` で配信）：アップロード（`capture="environment"`、処理状況表示）、再生（字幕 ON/OFF、場面タグ一覧で頭出し、再生バーに印、PDF ダウンロード）、動画配信（Range 対応） | API のテスト（TestClient）。画面は Playwright（環境にある Chromium）でスマホ幅の表示確認 |
 | 6 | 画面：ホーム（作業の種類を階層でたどる）、一覧（タグボタンで AND 絞り込み）、タグ管理（追加・編集・削除・別名・候補の採用） | 下位分類を含む一覧、AND 絞り込み、タグ CRUD・候補採用の API テスト |
 | 7 | サンプル動画（ffmpeg で合成した音声付き動画、または用意していただく動画）で通し確認 | ①〜③を通しで実行（ここだけ実モデルを使うかは環境次第。Colab での確認手順を README に記載） |
 
-各段階で「既存の対話研究の機能が変わっていないこと」を確認する回帰テストも走らせる（Q4 の方法による）。
+各段階で「既存の対話研究の機能が変わっていないこと」を確認する回帰テストも走らせる（5.2 のローダーによる）。
 
 ### 5.5 設定（`.env.example` に追記予定）
 
@@ -245,15 +248,12 @@ CLAUDE.md と方針資料を突き合わせ、計画に次の点を反映・確�
 
 **Q2. LLM はどれを使うか**
 既存は OpenAI `gpt-4o`。CLAUDE.md の「既存にあるものが優先」に従うと OpenAI になる。
-推奨：呼び出しを `skill_transfer/llm.py` に集約し、**既定は既存と同じ OpenAI**、環境変数 `SKILL_LLM_PROVIDER=anthropic` で Claude に切り替えられるようにする。Claude を既定にしたい場合はお知らせください。
+推奨：呼び出しを技能伝承セル内の 1 つの関数に集約し、**既定は既存と同じ OpenAI**、環境変数 `SKILL_LLM_PROVIDER=anthropic` で Claude に切り替えられるようにする。Claude を既定にしたい場合はお知らせください。
 
-**Q3. 画面（フロントエンド）**
-リポジトリ内に画面のコードがありません。既存の画面が別の場所にあれば、その技術（素の HTML か、React 等か）と置き場所を教えてください。
-無ければ、ビルド不要の **HTML＋素の JavaScript を FastAPI から配信**（`/skill/` 配下）する案を推奨します（Colab＋ngrok のままスマホから開ける）。
+**Q3. 画面（フロントエンド）** → **回答済み**：既存は単一 HTML（`kokusai.html`）。同じ書き方で `skill_transfer.html` を作り、スマホから開けるよう FastAPI から配信する（5.2）。`kokusai.html` には手を入れない。
 
-**Q4. コードの置き方とテスト**
-既存はセル貼り付け型で import できないため、新機能は `skill_transfer/` パッケージとして書き、Colab では「リポジトリを Drive などに clone → `sys.path` に追加」して読み込む形を推奨します。Colab にコードをどう持ち込んでいるか（セルに貼り付けか、clone か）を教えてください。
-テストは pytest を新たに導入します（既存にテストが無いため）。既存 API の回帰確認は、`audio_analysis_pipeline.py` を Colab 専用行と重い依存（torch・whisper・pyannote・colab）をスタブにして読み込むテスト用ローダーで行う想定です。この際、DB の場所を環境変数 `CORPUS_DB_PATH`（既定は現在と同じパス）で上書きできるよう **1 行だけ変更** してよいか確認させてください。
+**Q4. コードの置き方** → **回答済み**：Colab はセルに貼り付け。技能伝承は別セル `skill_transfer_cell.py` にし、既存セルにはサーバー起動直前の登録の数行だけを追加する（5.2）。
+テストは pytest を新たに導入し、セルファイルを読み込むローダーで既存 API の回帰確認も行う（既存コードの書き換えは不要）。
 
 **Q5. 匿名化を技能伝承動画にもかけるか**
 既存の `[MASK]` 置換は、道具の商品名・メーカー名・現場名まで伏せる可能性があり、手順書やタグ付けの質が落ちます。推奨は**既定 OFF（設定で ON 可）**。個人名を伏せる必要があれば ON にします。
@@ -282,4 +282,5 @@ LLM に「〜するのがコツ」「感覚としては〜」のような説明�
 - **PDF の日本語フォント**：Colab で WeasyPrint を使うには日本語フォント（`fonts-noto-cjk`）の導入が必要。README に手順を書く。
 - **ngrok の警告ページ**：無料枠では最初に「Visit Site」画面が出る（既存の案内と同じ）。画面を同じオリジンから配信すれば、1 回押せば以後は動く。
 - **既存コードで目についた点（参考、今回は変更しない）**：`sessions.filename` が一時ファイル名（`input_xxx`）で元動画が残らない／アップロードファイル名をそのままパスに使っている／ジョブ状態が再起動で消える／WER・CER の計算がサーバーと精度ツールで重複。
+- **既存画面の表示**：`kokusai.html` は検索結果などのテキストを `innerHTML` にそのまま入れている。新しい画面では文字起こしやタグ名を必ずエスケープして表示する（既存画面は変更しない）。
 - **認証**：既存にログイン・権限は無いため、CLAUDE.md に従い新設しない（ngrok URL を知っていれば誰でも見られる点は既存と同じ）。
