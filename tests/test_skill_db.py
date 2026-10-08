@@ -114,3 +114,34 @@ def test_defaults(skill):
     assert skill.SKILL_DIFFICULTY_TAG is False
     assert skill.SKILL_ANONYMIZE is False
     assert skill.SKILL_LLM_PROVIDER == "openai"
+
+
+def test_serialized_connection_survives_concurrent_queries(skill, conn):
+    """処理スレッドと画面からの問い合わせが同じ動画を同時に読んでも、空の結果にならないこと。"""
+    import threading
+    db = skill.SerializedConnection(conn)
+    video_id = skill.create_skill_video(db, "型枠", "", "a.mp4")
+    failures = []
+
+    def worker():
+        for _ in range(300):
+            if skill.get_skill_video(db, video_id) is None:
+                failures.append(1)
+            skill.update_skill_video(db, video_id, status="transcribe")
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert failures == []
+
+
+def test_serialized_connection_behaves_like_cursor(skill, conn):
+    db = skill.SerializedConnection(conn)
+    cur = db.execute("INSERT INTO skill_tags (name, category) VALUES ('a', '道具')")
+    assert cur.lastrowid == 1 and cur.rowcount == 1
+    db.commit()
+    assert db.execute("SELECT name FROM skill_tags").fetchone() == ("a",)
+    assert db.execute("SELECT name FROM skill_tags WHERE name='x'").fetchone() is None
+    assert [r for r in db.execute("SELECT name FROM skill_tags")] == [("a",)]

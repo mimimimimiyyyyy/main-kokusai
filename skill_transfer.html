@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>技能伝承動画</title>
+    <style>
+        :root {
+            --accent: #e67e00; --accent-dark: #b86400; --bg: #f6f6f4; --card: #ffffff;
+            --text: #222; --sub: #666; --line: #ddd; --danger: #c62828; --tip: #0b5394; --ok: #2e7d32;
+        }
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: sans-serif; line-height: 1.6; color: var(--text); background: var(--bg); }
+        header { position: sticky; top: 0; z-index: 10; background: #333; color: #fff; padding: 8px 12px;
+                 display: flex; align-items: center; gap: 8px; }
+        header h1 { font-size: 1.05em; margin: 0; flex: 1; white-space: nowrap; }
+        header a { color: #fff; text-decoration: none; background: #555; padding: 8px 12px; border-radius: 6px; font-size: 0.9em; }
+        header a.upload { background: var(--accent); }
+        .container { max-width: 960px; margin: 0 auto; padding: 12px; }
+        .section { background: var(--card); padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid var(--line); }
+        h2 { font-size: 1.1em; margin: 0 0 8px; border-left: 5px solid var(--accent); padding-left: 8px; }
+        .muted { color: var(--sub); font-size: 0.9em; }
+        .error { color: var(--danger); }
+        button, .button { font-size: 1em; border: none; border-radius: 8px; padding: 12px 14px; cursor: pointer;
+                          background: #e0e0e0; color: var(--text); text-decoration: none; display: inline-block; text-align: center; }
+        button.primary, .button.primary { background: var(--accent); color: #fff; font-weight: bold; }
+        button.small { padding: 6px 10px; font-size: 0.85em; }
+        button:disabled { opacity: 0.5; }
+        input[type=text], select { font-size: 1em; padding: 10px; width: 100%; border: 1px solid #bbb; border-radius: 6px; }
+        label { display: block; font-weight: bold; margin: 10px 0 4px; }
+        .big-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .big-buttons button, .big-buttons .button { padding: 18px 8px; font-size: 1.05em; }
+        .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+        .chip { border: 1px solid #bbb; background: #fff; border-radius: 16px; padding: 4px 12px; font-size: 0.9em; cursor: pointer; }
+        .chip.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
+        .chip .cat { font-size: 0.75em; color: var(--sub); margin-right: 4px; }
+        .chip.selected .cat { color: #ffe0b2; }
+
+        /* アップロード */
+        .file-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .file-buttons label { margin: 0; padding: 18px 8px; text-align: center; border-radius: 8px; background: #e0e0e0; cursor: pointer; font-weight: bold; }
+        .file-buttons label.camera { background: var(--accent); color: #fff; }
+        .file-buttons input { display: none; }
+        progress { width: 100%; height: 14px; }
+        .steps-status { list-style: none; padding: 0; margin: 8px 0; }
+        .steps-status li { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+        .steps-status li.done::before { content: "✔ "; color: var(--ok); }
+        .steps-status li.running { font-weight: bold; color: var(--accent-dark); }
+        .steps-status li.running::before { content: "▶ "; }
+        .steps-status li.failed { color: var(--danger); font-weight: bold; }
+        .steps-status li.failed::before { content: "✖ "; }
+        .steps-status li.waiting { color: var(--sub); }
+        .steps-status li.waiting::before { content: "・ "; }
+
+        /* 再生 */
+        .player-wrap { background: #000; border-radius: 8px; overflow: hidden; }
+        video { width: 100%; max-height: 60vh; display: block; background: #000; }
+        video::cue { font-size: 1.1em; background: rgba(0,0,0,0.75); }
+        .scene-bar { position: relative; height: 26px; background: #444; cursor: pointer; }
+        .scene-bar .mark { position: absolute; top: 3px; bottom: 3px; background: var(--accent); border-left: 2px solid #fff;
+                           color: #fff; font-size: 0.7em; overflow: hidden; white-space: nowrap; padding-left: 2px; }
+        .scene-bar .mark:nth-child(even) { background: #ffa726; }
+        .scene-bar .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; pointer-events: none; }
+        .player-tools { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+        .step-card { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+        .step-card.current { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; }
+        .step-head { display: flex; align-items: center; gap: 8px; background: #fff3e0; padding: 8px 10px; cursor: pointer; }
+        .step-head .time { font-family: monospace; color: var(--accent-dark); font-weight: bold; }
+        .step-head .title { font-weight: bold; flex: 1; }
+        .step-body { padding: 8px 10px; font-size: 0.95em; }
+        .step-body .label { font-weight: bold; margin-right: 4px; }
+        .step-body .caution { color: var(--danger); }
+        .step-body .tip { color: var(--tip); }
+        .transcript p { margin: 0; padding: 4px 0; border-bottom: 1px dotted var(--line); cursor: pointer; }
+        .transcript .time { font-family: monospace; color: var(--sub); margin-right: 6px; }
+        details summary { cursor: pointer; font-weight: bold; padding: 4px 0; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🦺 技能伝承動画</h1>
+        <a href="#/">ホーム</a>
+        <a href="#/upload" class="upload">撮影・投稿</a>
+    </header>
+    <div class="container" id="app"></div>
+
+    <script>
+        // スマホでは Colab の ngrok URL の末尾に /skill を付けて開く（この場合は自動で配信元を使う）。
+        // kokusai.html と同じく、PCでこのファイルを直接開く場合は、ここに ngrok URL を貼り付ける。
+        const BASE_URL = location.protocol.startsWith("http") ? location.origin : "https://xxxx.ngrok-free.dev";
+        const NGROK_HEADERS = { 'ngrok-skip-browser-warning': 'true' };
+
+        const STEP_LABELS = [
+            ["media", "動画の変換"],
+            ["transcribe", "文字起こし・字幕"],
+            ["procedure", "手順書"],
+            ["tagging", "タグ付け"],
+        ];
+        const app = document.getElementById('app');
+        let pollTimer = null;
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // 文字起こしやタグ名は利用者の入力・AIの出力なので、必ずエスケープしてから表示する
+        function esc(text) {
+            return String(text ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+        }
+
+        function clock(seconds) {
+            const s = Math.floor(seconds || 0);
+            return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+        }
+
+        async function api(path, options = {}) {
+            const response = await fetch(`${BASE_URL}${path}`, {
+                ...options,
+                headers: { ...NGROK_HEADERS, ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) },
+            });
+            const text = await response.text();
+            const data = text ? JSON.parse(text) : {};
+            if (!response.ok) {
+                throw new Error(data.detail || `サーバーエラー(${response.status})`);
+            }
+            return data;
+        }
+
+        // --- 画面の切り替え（#/〜 で画面を表す。タップで戻る・進むができるように） ---
+        function route() {
+            clearTimeout(pollTimer);
+            const [path, query] = location.hash.replace(/^#/, "").split("?");
+            const params = new URLSearchParams(query || "");
+            const parts = (path || "/").split("/").filter(Boolean);
+            window.scrollTo(0, 0);
+            if (parts[0] === "upload") return renderUpload();
+            if (parts[0] === "video" && parts[1]) return renderVideo(Number(parts[1]), params);
+            return renderHome();
+        }
+        window.addEventListener("hashchange", route);
+
+        function showError(err) {
+            app.innerHTML = `<div class="section error">エラー: ${esc(err.message)}</div>`;
+        }
+
+        // --- ホーム ---
+        function renderHome() {
+            app.innerHTML = `
+                <div class="section">
+                    <h2>技能伝承動画</h2>
+                    <p class="muted">熟練者の作業説明を動画で記録し、字幕・手順書・タグを自動で作ります。</p>
+                    <a class="button primary" href="#/upload">動画を撮影・投稿する</a>
+                </div>`;
+        }
+
+        // --- アップロード ---
+        function renderUpload() {
+            app.innerHTML = `
+                <div class="section">
+                    <h2>動画を撮影・投稿</h2>
+                    <div class="file-buttons">
+                        <label class="camera">📹 撮影する<input type="file" id="camera-input" accept="video/*" capture="environment"></label>
+                        <label>📁 ファイル選択<input type="file" id="file-input" accept="video/*"></label>
+                    </div>
+                    <p id="file-name" class="muted">動画が選ばれていません</p>
+                    <label for="title">タイトル（作業の内容）</label>
+                    <input type="text" id="title" placeholder="例: 型枠の建て込み">
+                    <label for="explainer">説明者（任意）</label>
+                    <input type="text" id="explainer" placeholder="例: 山田">
+                    <p><button class="primary" id="upload-button" onclick="uploadVideo()">投稿する</button></p>
+                    <div id="upload-progress" style="display:none">
+                        <p class="muted" id="upload-text">アップロード中...</p>
+                        <progress id="upload-bar" max="100" value="0"></progress>
+                    </div>
+                    <div id="status-area"></div>
+                </div>`;
+            let selected = null;
+            for (const id of ["camera-input", "file-input"]) {
+                document.getElementById(id).addEventListener("change", e => {
+                    selected = e.target.files[0] || selected;
+                    document.getElementById("file-name").textContent = selected ? `選んだ動画: ${selected.name}` : "動画が選ばれていません";
+                });
+            }
+            window.selectedFile = () => selected;
+        }
+
+        function uploadVideo() {
+            const file = window.selectedFile();
+            const title = document.getElementById("title").value.trim();
+            if (!file) return alert("動画を撮影するか、ファイルを選んでください");
+            if (!title) return alert("タイトルを入力してください");
+
+            const formData = new FormData();
+            formData.append("file", file);
+            formData.append("title", title);
+            formData.append("explainer", document.getElementById("explainer").value.trim());
+
+            // fetch ではアップロードの進み具合が分からないため、XMLHttpRequest を使う
+            // （スマホの動画は大きく、送信に時間がかかるため）
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", `${BASE_URL}/skill/api/videos`);
+            xhr.setRequestHeader("ngrok-skip-browser-warning", "true");
+            document.getElementById("upload-button").disabled = true;
+            document.getElementById("upload-progress").style.display = "block";
+            xhr.upload.onprogress = e => {
+                if (e.lengthComputable) {
+                    const pct = Math.round(e.loaded / e.total * 100);
+                    document.getElementById("upload-bar").value = pct;
+                    document.getElementById("upload-text").textContent = `アップロード中... ${pct}%`;
+                }
+            };
+            xhr.onload = () => {
+                let data = {};
+                try { data = JSON.parse(xhr.responseText); } catch (e) { }
+                if (xhr.status !== 200) {
+                    document.getElementById("upload-button").disabled = false;
+                    return alert("アップロードに失敗しました: " + (data.detail || xhr.status));
+                }
+                document.getElementById("upload-text").textContent = "アップロード完了。自動処理を行っています（数分かかることがあります）";
+                pollStatus(data.video_id);
+            };
+            xhr.onerror = () => {
+                document.getElementById("upload-button").disabled = false;
+                alert("アップロードに失敗しました。通信状態を確認してください。");
+            };
+            xhr.send(formData);
+        }
+
+        function renderStatus(video) {
+            const names = STEP_LABELS.map(s => s[0]);
+            const current = video.status === "error" ? video.failed_step : video.status;
+            const currentIndex = video.status === "done" ? names.length : names.indexOf(current);
+            const items = STEP_LABELS.map(([name, label], i) => {
+                let cls = "waiting";
+                if (i < currentIndex) cls = "done";
+                else if (i === currentIndex) cls = video.status === "error" ? "failed" : "running";
+                return `<li class="${cls}">${label}</li>`;
+            }).join("");
+            let footer = "";
+            if (video.status === "done") {
+                footer = `<a class="button primary" href="#/video/${video.video_id}">動画を見る</a>`;
+            } else if (video.status === "error") {
+                footer = `<p class="error">失敗しました: ${esc(video.error)}</p>
+                          <button class="primary" onclick="retryVideo(${video.video_id})">失敗したところから再実行</button>`;
+            }
+            return `<h2>処理の状況: ${esc(video.title)}</h2><ul class="steps-status">${items}</ul>${footer}`;
+        }
+
+        async function pollStatus(videoId) {
+            const area = document.getElementById("status-area");
+            if (!area) return;
+            try {
+                const video = await api(`/skill/api/videos/${videoId}`);
+                area.innerHTML = renderStatus(video);
+                if (video.status !== "done" && video.status !== "error") {
+                    pollTimer = setTimeout(() => pollStatus(videoId), 3000);
+                }
+            } catch (err) {
+                area.innerHTML = `<p class="error">状況を取得できませんでした: ${esc(err.message)}</p>`;
+                pollTimer = setTimeout(() => pollStatus(videoId), 3000);
+            }
+        }
+
+        async function retryVideo(videoId) {
+            try {
+                await api(`/skill/api/videos/${videoId}/retry`, { method: "POST" });
+                pollStatus(videoId);
+            } catch (err) {
+                alert("再実行できませんでした: " + err.message);
+            }
+        }
+
+        // --- 再生 ---
+        async function renderVideo(videoId, params) {
+            app.innerHTML = `<div class="section muted">読み込み中...</div>`;
+            let video;
+            try {
+                video = await api(`/skill/api/videos/${videoId}`);
+            } catch (err) {
+                return showError(err);
+            }
+            if (video.status !== "done") {
+                app.innerHTML = `<div class="section" id="status-area">${renderStatus(video)}</div>`;
+                if (video.status !== "error") pollTimer = setTimeout(() => pollStatus(videoId), 3000);
+                return;
+            }
+
+            const tagsByStep = {};
+            for (const t of video.scene_tags) (tagsByStep[t.step_id] ||= []).push(t);
+            const list = (label, values, cls = "") =>
+                values && values.length ? `<div class="${cls}"><span class="label">${label}</span>${values.map(esc).join("、")}</div>` : "";
+            const stepCards = video.steps.map((s, i) => `
+                <div class="step-card" id="step-${s.step_id}" data-start="${s.start}" data-end="${s.end}">
+                    <div class="step-head" onclick="seekTo(${s.start})">
+                        <span class="time">${clock(s.start)}</span>
+                        <span class="title">手順${i + 1}　${esc(s.title)}</span>
+                        <span>▶</span>
+                    </div>
+                    <div class="step-body">
+                        <div>${esc(s.description)}</div>
+                        ${list("道具", s.tools)}${list("資材", s.materials)}
+                        ${list("注意点", s.cautions, "caution")}${list("コツ", s.tips, "tip")}
+                        <div class="chips" style="margin-top:6px">
+                            ${(tagsByStep[s.step_id] || []).map(t => `<span class="chip scene-tag" onclick="seekTo(${t.start})"><span class="cat">${esc(t.category)}</span>${esc(t.name)}</span>`).join("")}
+                        </div>
+                    </div>
+                </div>`).join("");
+            const marks = video.steps.map((s, i) => {
+                const left = s.start / video.duration * 100;
+                const width = Math.max((s.end - s.start) / video.duration * 100, 1);
+                return `<div class="mark" style="left:${left}%;width:${width}%" title="${esc(s.title)}" onclick="event.stopPropagation();seekTo(${s.start})">${i + 1}</div>`;
+            }).join("");
+            const transcript = video.segments.map(s =>
+                `<p onclick="seekTo(${s.start})"><span class="time">${clock(s.start)}</span>${esc(s.text)}</p>`).join("");
+
+            app.innerHTML = `
+                <div class="section">
+                    <h2>${esc(video.title)}</h2>
+                    <div class="muted">${video.explainer ? `説明者: ${esc(video.explainer)}　` : ""}長さ: ${clock(video.duration)}</div>
+                    <div class="chips" style="margin:6px 0">${video.video_tags.map(t => `<span class="chip"><span class="cat">${esc(t.category)}</span>${esc(t.name)}</span>`).join("")}</div>
+                    <div class="player-wrap">
+                        <video id="player" controls playsinline preload="metadata" src="${BASE_URL}/skill/api/videos/${videoId}/media">
+                            <track id="subtitles" kind="subtitles" srclang="ja" label="日本語" default src="${BASE_URL}/skill/api/videos/${videoId}/subtitles.vtt">
+                        </video>
+                        <div class="scene-bar" id="scene-bar" title="場面の印（タップでその場面へ）">${marks}<div class="playhead" id="playhead"></div></div>
+                    </div>
+                    <div class="player-tools">
+                        <button id="subtitle-toggle" onclick="toggleSubtitles()">字幕: 表示中</button>
+                        ${video.has_pdf ? `<a class="button primary" id="pdf-link" href="${BASE_URL}/skill/api/videos/${videoId}/procedure.pdf" download>📄 手順書PDF</a>` : ""}
+                    </div>
+                </div>
+                <div class="section">
+                    <h2>手順と場面（タップでその場面から再生）</h2>
+                    ${stepCards || '<p class="muted">手順がありません</p>'}
+                </div>
+                <div class="section transcript">
+                    <details><summary>文字起こし全文</summary>${transcript}</details>
+                </div>`;
+
+            const player = document.getElementById("player");
+            document.getElementById("scene-bar").addEventListener("click", e => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                seekTo((e.clientX - rect.left) / rect.width * video.duration);
+            });
+            player.addEventListener("timeupdate", () => {
+                document.getElementById("playhead").style.left = `${player.currentTime / video.duration * 100}%`;
+                for (const card of document.querySelectorAll(".step-card")) {
+                    const inStep = player.currentTime >= Number(card.dataset.start) && player.currentTime < Number(card.dataset.end);
+                    card.classList.toggle("current", inStep);
+                }
+            });
+            if (params.get("t")) seekTo(Number(params.get("t")));
+        }
+
+        function seekTo(seconds) {
+            const player = document.getElementById("player");
+            if (!player) return;
+            player.currentTime = seconds;
+            player.play().catch(() => { });  // 自動再生が止められても、位置の移動はできている
+            player.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+
+        function toggleSubtitles() {
+            const track = document.getElementById("player").textTracks[0];
+            const showing = track.mode === "showing";
+            track.mode = showing ? "hidden" : "showing";
+            document.getElementById("subtitle-toggle").textContent = showing ? "字幕: 非表示" : "字幕: 表示中";
+        }
+
+        route();
+    </script>
+</body>
+</html>

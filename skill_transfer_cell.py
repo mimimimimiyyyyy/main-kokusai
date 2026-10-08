@@ -240,6 +240,51 @@ def list_skill_tags(conn, category=None):
     return [tag_row_to_dict(r) for r in conn.execute(sql + " ORDER BY id", params).fetchall()]
 
 
+class QueryResult:
+    """SerializedConnection.execute の戻り値（結果は取り出し済み）。sqlite3のカーソルと同じ使い方ができる。"""
+
+    def __init__(self, rows, lastrowid, rowcount):
+        self._rows = rows
+        self.lastrowid = lastrowid
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self):
+        rows, self._rows = self._rows, []
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class SerializedConnection:
+    """
+    1つのSQLite接続を、処理のスレッドと画面からの問い合わせ（状況の確認など）で同時に使うと、
+    同じSQL文の準備済みステートメントを取り合って、片方に空の結果が返ることがある。
+    問い合わせ1回分（実行〜結果の取り出し）をロックの中で行い、順番に処理する。
+    """
+
+    def __init__(self, conn):
+        self.raw = conn
+        self._lock = threading.RLock()
+
+    def execute(self, sql, params=()):
+        with self._lock:
+            cur = self.raw.execute(sql, params)
+            rows = cur.fetchall() if cur.description else []
+            return QueryResult(rows, cur.lastrowid, cur.rowcount)
+
+    def commit(self):
+        with self._lock:
+            self.raw.commit()
+
+    def close(self):
+        with self._lock:
+            self.raw.close()
+
+
 def open_skill_db(path=None):
     """
     既存セルと同じcorpus.dbを、技能伝承用の別の接続で開く。既存セルの conn を
@@ -1178,7 +1223,7 @@ SKILL_STEP_NAMES = [name for name, _ in SKILL_STEPS]
 
 # --- 10. API（/skill/api/...） ---
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 ALLOWED_VIDEO_EXT = re.compile(r"^\.[a-z0-9]{1,5}$")
 
@@ -1209,6 +1254,18 @@ def create_skill_router(ctx):
         if video is None:
             raise HTTPException(status_code=404, detail="動画が見つかりません")
         return video
+
+    @router.get("/skill", response_class=HTMLResponse)
+    def api_skill_page():
+        # スマホからは「ngrokのURL/skill」で開く（同じ所から配信すると、動画や字幕も
+        # ngrokの警告ページに止められずに読み込める）
+        if not os.path.exists(ctx.html_path):
+            return HTMLResponse(
+                "<meta charset='utf-8'><p>画面のファイル（skill_transfer.html）が見つかりません。"
+                f"Google Driveの {ctx.html_path} に置いてから、セルを実行し直してください。</p>",
+                status_code=404)
+        with open(ctx.html_path, encoding="utf-8") as f:
+            return HTMLResponse(f.read())
 
     @router.post("/skill/api/videos")
     # 既存の/uploadと同じく、重い処理を待たずにIDをすぐ返し、処理は裏で行う
@@ -1287,7 +1344,7 @@ def create_skill_router(ctx):
 
 
 def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=None, mask_fn=None,
-                            llm_fn=None, media_dir=None, seed_csv=None, run_in_background=True):
+                            llm_fn=None, media_dir=None, seed_csv=None, html_path=None, run_in_background=True):
     """
     技能伝承のAPIを既存のFastAPIアプリに追加する。既存のルートには触れない。
     タグ一覧が空のときだけ初期データ（seed CSV）を入れる。
@@ -1295,10 +1352,13 @@ def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=No
     """
     media_dir = media_dir or SKILL_MEDIA_DIR
     seed_csv = seed_csv or SKILL_SEED_CSV
+    html_path = html_path or SKILL_HTML_PATH
     if conn is None:
         conn = open_skill_db()
     else:
         init_skill_db(conn)
+    if not isinstance(conn, SerializedConnection):
+        conn = SerializedConnection(conn)
     os.makedirs(media_dir, exist_ok=True)
     if conn.execute("SELECT COUNT(*) FROM skill_tags").fetchone()[0] == 0 and os.path.exists(seed_csv):
         print("技能伝承: タグ一覧の初期データを投入しました", seed_skill_tags(conn, seed_csv))
@@ -1307,6 +1367,7 @@ def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=No
     ctx = SkillContext(conn, media_dir=media_dir, whisper_model=whisper_model, llm_fn=llm_fn,
                        mask_fn=mask_fn, run_in_background=run_in_background)
     ctx.openai_client = openai_client
+    ctx.html_path = html_path
     app.include_router(create_skill_router(ctx))
     app.state.skill_transfer = ctx
     return ctx
