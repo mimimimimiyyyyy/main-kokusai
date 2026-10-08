@@ -239,6 +239,14 @@ DEFAULT_PROCEDURE = {
 }
 
 
+DEFAULT_TAG_TERMS = {
+    "steps": [
+        {"step_index": 0, "terms": [{"word": "型枠", "category": "作業"}, {"word": "建て込み", "category": "作業"}]},
+        {"step_index": 1, "terms": [{"word": "セパ", "category": "資材"}, {"word": "Pコン", "category": "資材"}]},
+    ]
+}
+
+
 class FakeLLM:
     """
     LLM（OpenAI / Claude）の代わり。プロンプト先頭の「# task: 〜」で用途を見分け、
@@ -246,7 +254,7 @@ class FakeLLM:
     """
 
     def __init__(self, **responses):
-        self.responses = {"procedure": [DEFAULT_PROCEDURE], **responses}
+        self.responses = {"procedure": [DEFAULT_PROCEDURE], "tag_terms": [DEFAULT_TAG_TERMS], **responses}
         self.prompts = []
         self.method_version = "fake:llm"
 

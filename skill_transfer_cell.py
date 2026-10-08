@@ -531,13 +531,15 @@ class SkillContext:
     """技能伝承の処理に必要なもの一式。Colabでは既存セルのモデル・クライアントを入れる。"""
 
     def __init__(self, conn, media_dir=SKILL_MEDIA_DIR, whisper_model=None, llm_fn=None,
-                 mask_fn=None, anonymize=SKILL_ANONYMIZE, run_in_background=True):
+                 mask_fn=None, anonymize=SKILL_ANONYMIZE, difficulty=SKILL_DIFFICULTY_TAG,
+                 run_in_background=True):
         self.conn = conn
         self.media_dir = media_dir
         self.whisper_model = whisper_model
         self.llm_fn = llm_fn
         self.mask_fn = mask_fn
         self.anonymize = anonymize
+        self.difficulty = difficulty
         self.run_in_background = run_in_background
         # GPU上のWhisperを複数の動画で同時に使うとメモリが足りなくなるため、
         # 技能伝承の処理は1本ずつ順番に行う。
@@ -956,11 +958,225 @@ def step_procedure(ctx, video_id):
     update_skill_video(ctx.conn, video_id, pdf_path=pdf_path)
 
 
-SKILL_STEPS = [("media", step_media), ("transcribe", step_transcribe), ("procedure", step_procedure)]
+# --- 9. ③ タグ付け ---
+import unicodedata
+from rapidfuzz import fuzz
+
+TERM_CATEGORIES = ["作業", "道具", "資材", "安全"]
+# 難易度の目安（手順の数＋注意点の数）。これ以下なら初級、次の値以下なら中級、それより多ければ上級
+SKILL_DIFFICULTY_THRESHOLDS = [("初級", 4), ("中級", 8), ("上級", None)]
+
+
+class StepTerms(BaseModel):
+    step_index: int
+    terms: list[dict]
+
+
+class TagTermsResult(BaseModel):
+    steps: list[StepTerms]
+
+
+def validate_tag_terms(data, n_steps):
+    result = TagTermsResult.model_validate(data)
+    seen = set()
+    for item in result.steps:
+        if not 0 <= item.step_index < n_steps:
+            raise ValueError(f"step_index {item.step_index} が範囲外です（0〜{n_steps - 1}）")
+        if item.step_index in seen:
+            raise ValueError(f"step_index {item.step_index} が重複しています")
+        seen.add(item.step_index)
+        for term in item.terms:
+            if not str(term.get("word", "")).strip():
+                raise ValueError("word が空です")
+            if term.get("category") not in TERM_CATEGORIES:
+                raise ValueError(f"category は {TERM_CATEGORIES} のいずれかにしてください: {term.get('category')}")
+    return result
+
+
+def build_tag_terms_prompt(title, steps, segments):
+    by_id = {s["segment_id"]: s["text"] for s in segments}
+    blocks = []
+    for i, step in enumerate(steps):
+        text = "".join(by_id.get(sid, "") for sid in step.get("segment_ids", []))
+        blocks.append(f"[{i}] {step['title']}\n{text}")
+    return f"""# task: tag_terms
+建設現場の作業説明動画の文字起こしを、手順ごとに示します。動画を探しやすくするためのタグの元になる言葉を、手順ごとに抜き出してください。
+
+- 抜き出すのは、作業名（例: 型枠組立、配筋）、道具（例: インパクトドライバー）、資材（例: コンパネ）、安全に関わる言葉（例: 墜落防止）だけ
+- category は「作業」「道具」「資材」「安全」のいずれか
+- 話された言葉をそのまま（略称・現場での呼び方でもよい）書く。言い換えや一般的すぎる言葉（作業、道具、ここ など）は入れない
+- 該当する言葉が無い手順は terms を空の配列にする
+
+動画のタイトル: {title}
+
+手順と文字起こし:
+{chr(10).join(blocks)}
+
+次の形のJSONだけを返してください:
+{{"steps": [{{"step_index": 0, "terms": [{{"word": "...", "category": "道具"}}]}}]}}
+"""
+
+
+def normalize_term(text):
+    """
+    全角・半角、大文字・小文字、空白や記号の違いをそろえて比べるための形にする。
+    カタカナ語の末尾の長音（ドライバ／ドライバー）も表記ゆれとして取り除く。
+    """
+    text = unicodedata.normalize("NFKC", text or "").lower()
+    text = re.sub(r"[―‐—–]", "ー", text)
+    text = re.sub(r"[\s・「」『』()（）\[\]、。,.]", "", text)
+    return re.sub(r"ー+$", "", text)
+
+
+def match_tag(word, tags, threshold=SKILL_TAG_FUZZY_THRESHOLD):
+    """
+    ③ の2: タグ一覧と照合する。完全一致（名前）→ 別名一致 → 文字列の類似度が閾値以上、の順。
+    難易度タグは言葉からは付けない。見つからなければ None。
+    """
+    key = normalize_term(word)
+    if not key:
+        return None
+    candidates = [t for t in tags if t["category"] != "難易度"]
+    for tag in candidates:
+        if normalize_term(tag["name"]) == key:
+            return {"tag": tag, "method": "name", "score": 100.0}
+    for tag in candidates:
+        if key in (normalize_term(a) for a in tag["aliases"]):
+            return {"tag": tag, "method": "alias", "score": 100.0}
+    # 類似度は表記ゆれ（送り仮名・誤認識など）を拾うためのもの。一方がもう一方を丸ごと
+    # 含む言葉（コンクリート／コンクリート打設）は意味の広さが違うので、ここでは一致させない。
+    best = None
+    for tag in candidates:
+        for name in [tag["name"]] + tag["aliases"]:
+            other = normalize_term(name)
+            if key in other or other in key:
+                continue
+            score = fuzz.ratio(key, other)
+            if score >= threshold and (best is None or score > best["score"]):
+                best = {"tag": tag, "method": "fuzzy", "score": round(score, 1)}
+    return best
+
+
+def judge_difficulty(steps, thresholds=SKILL_DIFFICULTY_THRESHOLDS):
+    """③ の4（任意）: 手順の数と注意点の数から、初級・中級・上級を決める。"""
+    score = len(steps) + sum(len(s.get("cautions", [])) for s in steps)
+    for name, limit in thresholds:
+        if limit is None or score <= limit:
+            return name, score
+
+
+def add_tag_candidate(conn, video_id, word, category):
+    """
+    タグ一覧に無い言葉を「新タグ候補」として残す（自動では登録しない）。
+    同じ言葉が保留中・却下済みの候補として既にあれば、重ねて登録しない。
+    """
+    key = normalize_term(word)
+    for existing_word, status in conn.execute("SELECT word, status FROM skill_tag_candidates").fetchall():
+        if normalize_term(existing_word) == key and status in ("pending", "rejected"):
+            return False
+    conn.execute(
+        "INSERT INTO skill_tag_candidates (video_id, word, category, status, created) VALUES (?,?,?,?,?)",
+        (video_id, word.strip(), category, "pending", now_str())
+    )
+    return True
+
+
+def assign_tags(conn, video_id, steps, step_terms, method_version, difficulty=SKILL_DIFFICULTY_TAG,
+                threshold=SKILL_TAG_FUZZY_THRESHOLD):
+    """
+    ③ の2〜5: 言葉をタグ一覧と照合し、手順の時間帯に場面タグを付け、場面タグをまとめて動画タグにする。
+    step_terms: {手順の番号: [{"word", "category"}, ...]}
+    """
+    tags = list_skill_tags(conn)
+    conn.execute("DELETE FROM skill_annotations WHERE video_id=? AND layer IN ('scene_tag', 'video_tag')", (video_id,))
+    now = now_str()
+    video_tag_ids = {}
+    new_candidates = 0
+    for i, step in enumerate(steps):
+        matched = {}
+        for term in step_terms.get(i, []):
+            m = match_tag(term["word"], tags, threshold)
+            if m is None:
+                new_candidates += add_tag_candidate(conn, video_id, term["word"], term.get("category"))
+                continue
+            entry = matched.setdefault(m["tag"]["tag_id"], {"tag": m["tag"], "words": [], "method": m["method"]})
+            entry["words"].append({"word": term["word"], "method": m["method"], "score": m["score"]})
+        for tag_id, entry in matched.items():
+            conn.execute(
+                """INSERT INTO skill_annotations
+                   (video_id, layer, start, end, label, tag_id, parent_id, payload, source, method_version, created)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (video_id, "scene_tag", step["start"], step["end"], entry["tag"]["name"], tag_id, step["step_id"],
+                 json.dumps({"words": entry["words"]}, ensure_ascii=False), "llm", method_version, now)
+            )
+            video_tag_ids[tag_id] = {"tag": entry["tag"], "source": "scene"}
+
+    if difficulty and steps:
+        level, score = judge_difficulty(steps)
+        level_tag = next((t for t in tags if t["category"] == "難易度" and t["name"] == level), None)
+        if level_tag:
+            video_tag_ids[level_tag["tag_id"]] = {"tag": level_tag, "source": "rule", "score": score}
+
+    for tag_id, entry in video_tag_ids.items():
+        conn.execute(
+            """INSERT INTO skill_annotations
+               (video_id, layer, label, tag_id, payload, source, method_version, created)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (video_id, "video_tag", entry["tag"]["name"], tag_id,
+             json.dumps({k: v for k, v in entry.items() if k != "tag"}, ensure_ascii=False),
+             "rule" if entry["source"] == "rule" else "llm", method_version, now)
+        )
+    conn.commit()
+    return {"video_tags": len(video_tag_ids), "new_candidates": new_candidates}
+
+
+def get_scene_tags(conn, video_id):
+    rows = conn.execute(
+        """SELECT a.id, a.start, a.end, a.tag_id, a.parent_id, t.name, t.category
+           FROM skill_annotations a JOIN skill_tags t ON t.id = a.tag_id
+           WHERE a.video_id=? AND a.layer='scene_tag' ORDER BY a.start, t.category, t.name""",
+        (video_id,)
+    ).fetchall()
+    return [{"scene_tag_id": r[0], "start": r[1], "end": r[2], "tag_id": r[3], "step_id": r[4],
+             "name": r[5], "category": r[6]} for r in rows]
+
+
+def get_video_tags(conn, video_id):
+    rows = conn.execute(
+        """SELECT t.id, t.name, t.category FROM skill_annotations a JOIN skill_tags t ON t.id = a.tag_id
+           WHERE a.video_id=? AND a.layer='video_tag' ORDER BY t.category, t.name""",
+        (video_id,)
+    ).fetchall()
+    return [{"tag_id": r[0], "name": r[1], "category": r[2]} for r in rows]
+
+
+def step_tagging(ctx, video_id):
+    """③ タグ付け（言葉の抽出 → タグ一覧と照合 → 場面タグ → 難易度 → 動画タグ）。"""
+    if ctx.llm_fn is None:
+        raise RuntimeError("LLMが設定されていません")
+    video = get_skill_video(ctx.conn, video_id)
+    steps = get_steps(ctx.conn, video_id)
+    if not steps:
+        raise RuntimeError("手順がありません（先に手順書を作る必要があります）")
+    prompt = build_tag_terms_prompt(video["title"], steps, get_segments(ctx.conn, video_id))
+    result, raw = call_llm_json(ctx.llm_fn, prompt, lambda d: validate_tag_terms(d, len(steps)))
+    step_terms = {item.step_index: list(item.terms) for item in result.steps}
+    # 手順書で取り出した道具・資材も、タグの元になる言葉として使う
+    for i, step in enumerate(steps):
+        extra = [{"word": w, "category": "道具"} for w in step.get("tools", [])]
+        extra += [{"word": w, "category": "資材"} for w in step.get("materials", [])]
+        step_terms.setdefault(i, []).extend(extra)
+    method_version = f"{getattr(ctx.llm_fn, 'method_version', 'llm')}@{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    save_llm_result(ctx.conn, video_id, "tag_terms", method_version, {"raw": raw})
+    assign_tags(ctx.conn, video_id, steps, step_terms, method_version, difficulty=ctx.difficulty)
+
+
+SKILL_STEPS = [("media", step_media), ("transcribe", step_transcribe), ("procedure", step_procedure),
+               ("tagging", step_tagging)]
 SKILL_STEP_NAMES = [name for name, _ in SKILL_STEPS]
 
 
-# --- 9. API（/skill/api/...） ---
+# --- 10. API（/skill/api/...） ---
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, Response
 
@@ -1015,7 +1231,9 @@ def create_skill_router(ctx):
     def api_skill_video(video_id: int):
         video = require_video(video_id)
         return {**video_summary(video), "segments": get_segments(ctx.conn, video_id),
-                "steps": [public_step(video_id, s) for s in get_steps(ctx.conn, video_id)]}
+                "steps": [public_step(video_id, s) for s in get_steps(ctx.conn, video_id)],
+                "scene_tags": get_scene_tags(ctx.conn, video_id),
+                "video_tags": get_video_tags(ctx.conn, video_id)}
 
     @router.post("/skill/api/videos/{video_id}/retry")
     def api_skill_retry(video_id: int):
@@ -1094,7 +1312,7 @@ def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=No
     return ctx
 
 
-# --- 10. 既存セルのサーバー起動時に自動で登録する仕組み ---
+# --- 11. 既存セルのサーバー起動時に自動で登録する仕組み ---
 def install_skill_transfer_hook(namespace=None):
     """
     uvicorn.Server.serve を包み、サーバー起動の直前に register_skill_transfer を呼ぶ。
