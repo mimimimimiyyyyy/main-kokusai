@@ -177,3 +177,149 @@ def test_text_from_ai_is_escaped(server, page, sample_video):
     page.wait_for_selector(".step-card")
     assert page.evaluate("window.hacked") is None
     assert "<b>太字</b>" in page.inner_text(".step-card")
+
+
+def add_done_video(skill, ctx, title, tag_names):
+    video_id = skill.create_skill_video(ctx.conn, title, "", "a.mp4")
+    skill.update_skill_video(ctx.conn, video_id, status="done", duration=90)
+    tags = {t["name"]: t for t in skill.list_skill_tags(ctx.conn)}
+    for name in tag_names:
+        ctx.conn.execute("INSERT INTO skill_annotations (video_id, layer, label, tag_id) VALUES (?,?,?,?)",
+                         (video_id, "video_tag", name, tags[name]["tag_id"]))
+    ctx.conn.commit()
+    return video_id
+
+
+def video_titles(page):
+    return sorted(page.locator("#video-list .video-card .title").all_inner_texts())
+
+
+def test_home_walks_work_type_hierarchy_to_list(skill, server, page, sample_video):
+    base, ctx, _ = server
+    upload_through_screen(page, base, sample_video)
+    add_done_video(skill, ctx, "鉄筋の結束", ["鉄筋結束", "ハッカー"])
+    add_done_video(skill, ctx, "ボード張り", ["ボード張り"])
+
+    page.goto(f"{base}/skill#/")
+    page.wait_for_selector(".work-grid a")
+    assert page.locator(".work-grid a").all_inner_texts() == [
+        "躯体工事\nさらに選ぶ ▶", "仕上工事\nさらに選ぶ ▶", "仮設工事\nさらに選ぶ ▶"]
+    assert no_horizontal_scroll(page)
+    screenshot(page, "04_home")
+
+    page.click(".work-grid a >> text=躯体工事")
+    page.wait_for_selector("text=型枠工事")
+    assert "コンクリート打設\n動画を見る" in page.locator(".work-grid a").all_inner_texts()
+    page.click(".work-grid a >> text=型枠工事")
+    page.wait_for_selector("text=型枠組立")
+    assert page.inner_text(".breadcrumb") == "ホーム ＞ 躯体工事 ＞ 型枠工事"
+
+    page.click("text=「型枠工事」の動画をすべて見る")
+    page.wait_for_selector("#video-list")
+    assert video_titles(page) == ["型枠の建て込み"]
+
+    page.goto(f"{base}/skill#/?work=1")  # 躯体工事（下位の分類の動画もすべて）
+    page.click("text=「躯体工事」の動画をすべて見る")
+    page.wait_for_selector("#video-list")
+    assert video_titles(page) == ["型枠の建て込み", "鉄筋の結束"]
+
+    page.click("#video-list .video-card >> text=型枠の建て込み")
+    page.wait_for_selector("#player")
+    assert page.errors == []
+
+
+def test_list_tag_buttons_filter_with_and(skill, server, page):
+    base, ctx, _ = server
+    add_done_video(skill, ctx, "型枠の建て込み", ["型枠組立", "インパクトドライバー", "コンパネ"])
+    add_done_video(skill, ctx, "型枠のばらし", ["型枠解体", "インパクトドライバー"])
+    add_done_video(skill, ctx, "鉄筋の結束", ["鉄筋結束", "ハッカー"])
+
+    page.goto(f"{base}/skill#/list")
+    page.wait_for_selector("#video-list")
+    assert len(video_titles(page)) == 3
+    assert no_horizontal_scroll(page)
+
+    page.click(".tag-filter >> text=インパクトドライバー")
+    page.wait_for_function("location.hash.includes('tags=')")
+    page.wait_for_selector("text=（2件）")
+    assert video_titles(page) == ["型枠のばらし", "型枠の建て込み"]
+    page.click(".tag-filter >> text=コンパネ")
+    page.wait_for_selector("text=（1件）")
+    assert video_titles(page) == ["型枠の建て込み"]
+    assert page.locator(".tag-filter.selected").count() == 2
+    screenshot(page, "05_list_filtered")
+
+    page.click(".tag-filter.selected >> text=インパクトドライバー")  # 選択を外す
+    page.wait_for_function("document.querySelectorAll('.tag-filter.selected').length === 1")
+    assert page.locator(".tag-filter.selected").all_inner_texts() == ["コンパネ ✕"]
+    page.click("text=絞り込みを解除")
+    page.wait_for_selector("text=（3件）")
+    assert page.errors == []
+
+
+def test_tag_management_screen(skill, server, page, sample_video):
+    base, ctx, _ = server
+    upload_through_screen(page, base, sample_video)  # 「Pコン」が新タグ候補になる
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.on("dialog", lambda d: d.accept())
+
+    page.goto(f"{base}/skill#/tags")
+    page.wait_for_selector("text=新タグ候補")
+    assert "Pコン" in page.inner_text("table >> nth=0")
+
+    # 候補を新しいタグとして採用 → 全動画のタグを付け直す
+    page.click("text=新しいタグにする")
+    page.select_option("select[id^=adopt-category-]", "資材")
+    page.click("text=採用する")
+    page.wait_for_selector("text=採用しました")
+    page.click("button:has-text('全動画のタグを付け直す')")
+    page.wait_for_selector("text=1本の動画のタグを付け直しました")
+    video = TestClient_get(base, "/skill/api/videos/1")
+    assert "Pコン" in [t["name"] for t in video["video_tags"]]
+
+    # 追加（別名つき）
+    page.fill("#tag-name", "バール")
+    page.select_option("#tag-category", "道具")
+    page.fill("#tag-aliases", "かじや|釘抜き")
+    page.click("#tag-save")
+    page.wait_for_selector("text=タグを追加しました")
+    assert "かじや、釘抜き" in page.inner_text("text=バール >> xpath=ancestor::tr")
+
+    # 編集（作業の階層の親を付け替え）
+    tags = TestClient_get(base, "/skill/api/tags")["tags"]
+    pid = next(t["tag_id"] for t in tags if t["name"] == "バール")
+    page.click(f"#tag-row-{pid} >> text=編集")
+    page.fill("#tag-name", "バール（釘抜き）")
+    page.click("#tag-save")
+    page.wait_for_selector("text=タグを保存しました")
+    assert page.locator(f"#tag-row-{pid}").inner_text().startswith("バール（釘抜き）")
+    screenshot(page, "06_tags")
+
+    # 削除（下位のタグがあるものは消せない）
+    page.click(f"#tag-row-{pid} >> text=削除")
+    page.wait_for_selector("text=タグを削除しました")
+    assert page.locator(f"#tag-row-{pid}").count() == 0
+    assert page.errors == []
+
+
+def TestClient_get(base, path):
+    import json
+    import urllib.request
+    with urllib.request.urlopen(base + path) as res:
+        return json.loads(res.read())
+
+
+def test_recent_uploads_show_status_and_failed_video_can_be_opened(server, page, sample_video):
+    base, ctx, llm = server
+    llm.responses["procedure"] = ["だめ", "だめ"]
+    page.goto(f"{base}/skill#/upload")
+    page.set_input_files("#file-input", str(sample_video))
+    page.fill("#title", "失敗する動画")
+    page.click("#upload-button")
+    page.wait_for_selector("text=失敗したところから再実行", timeout=30000)
+    # 処理が終わると、同じ画面の「最近の投稿」も更新される
+    page.wait_for_selector("#recent-uploads .status-badge.error")
+    assert page.inner_text("#recent-uploads .status-badge") == "失敗"
+    page.click("#recent-uploads .video-card")
+    page.wait_for_selector("text=失敗したところから再実行")
+    assert page.errors == []

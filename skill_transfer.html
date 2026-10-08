@@ -32,6 +32,7 @@
         .big-buttons button, .big-buttons .button { padding: 18px 8px; font-size: 1.05em; }
         .chips { display: flex; flex-wrap: wrap; gap: 6px; }
         .chip { border: 1px solid #bbb; background: #fff; border-radius: 16px; padding: 4px 12px; font-size: 0.9em; cursor: pointer; }
+        a.chip { text-decoration: none; color: var(--text); }
         .chip.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
         .chip .cat { font-size: 0.75em; color: var(--sub); margin-right: 4px; }
         .chip.selected .cat { color: #ffe0b2; }
@@ -74,6 +75,32 @@
         .transcript p { margin: 0; padding: 4px 0; border-bottom: 1px dotted var(--line); cursor: pointer; }
         .transcript .time { font-family: monospace; color: var(--sub); margin-right: 6px; }
         details summary { cursor: pointer; font-weight: bold; padding: 4px 0; }
+
+        /* ホーム・一覧 */
+        .breadcrumb { font-size: 0.9em; margin-bottom: 8px; }
+        .breadcrumb a { color: var(--accent-dark); }
+        .work-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .work-grid a { display: block; background: #fff; border: 2px solid var(--accent); color: var(--text); text-decoration: none;
+                       border-radius: 10px; padding: 16px 8px; text-align: center; font-weight: bold; font-size: 1.05em; }
+        .work-grid a .more { display: block; font-size: 0.75em; color: var(--sub); font-weight: normal; }
+        .filter-group { margin-bottom: 6px; }
+        .filter-group .group-label { font-size: 0.8em; color: var(--sub); margin-bottom: 2px; }
+        .video-card { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); text-decoration: none; color: var(--text); }
+        .video-card img, .video-card .noimg { width: 120px; height: 68px; object-fit: cover; border-radius: 6px; background: #ccc; flex: none; }
+        .video-card .info { flex: 1; min-width: 0; }
+        .video-card .title { font-weight: bold; }
+        .video-card .chips .chip { font-size: 0.75em; padding: 1px 8px; cursor: default; }
+        .status-badge { font-size: 0.75em; padding: 1px 8px; border-radius: 10px; background: #eee; }
+        .status-badge.error { background: #ffebee; color: var(--danger); }
+
+        /* タグ管理（PC想定） */
+        table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
+        th, td { border-bottom: 1px solid var(--line); padding: 6px; text-align: left; vertical-align: top; }
+        th { background: #fafafa; }
+        td.actions { white-space: nowrap; }
+        .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; align-items: end; }
+        .inline-form { background: #fff8e1; padding: 8px; border-radius: 6px; margin-top: 6px; }
+        .notice { background: #e8f5e9; padding: 8px; border-radius: 6px; margin-bottom: 8px; }
     </style>
 </head>
 <body>
@@ -135,7 +162,9 @@
             window.scrollTo(0, 0);
             if (parts[0] === "upload") return renderUpload();
             if (parts[0] === "video" && parts[1]) return renderVideo(Number(parts[1]), params);
-            return renderHome();
+            if (parts[0] === "list") return renderList(params);
+            if (parts[0] === "tags") return renderTags();
+            return renderHome(params);
         }
         window.addEventListener("hashchange", route);
 
@@ -143,13 +172,117 @@
             app.innerHTML = `<div class="section error">エラー: ${esc(err.message)}</div>`;
         }
 
-        // --- ホーム ---
-        function renderHome() {
+        // --- タグ一覧（作業の種類の階層をたどるために使う） ---
+        async function loadTags() {
+            const data = await api("/skill/api/tags");
+            const byId = Object.fromEntries(data.tags.map(t => [t.tag_id, t]));
+            const children = id => data.tags.filter(t => t.parent_id === id);
+            const ancestors = id => {
+                const chain = [];
+                for (let t = byId[id]; t; t = byId[t.parent_id]) chain.unshift(t);
+                return chain;
+            };
+            return { ...data, byId, children, ancestors };
+        }
+
+        function breadcrumb(tags, workId, linkLast) {
+            const chain = workId ? tags.ancestors(workId) : [];
+            const items = [`<a href="#/">ホーム</a>`].concat(chain.map((t, i) =>
+                i === chain.length - 1 && !linkLast ? esc(t.name) : `<a href="#/?work=${t.tag_id}">${esc(t.name)}</a>`));
+            return `<div class="breadcrumb">${items.join(" ＞ ")}</div>`;
+        }
+
+        // --- ホーム（作業の種類のボタンを、階層をタップでたどる） ---
+        async function renderHome(params) {
+            let tags;
+            try {
+                tags = await loadTags();
+            } catch (err) {
+                return showError(err);
+            }
+            const workId = params.get("work") ? Number(params.get("work")) : null;
+            const current = workId ? tags.byId[workId] : null;
+            const items = tags.children(workId).filter(t => t.category === "作業");
+            const buttons = items.map(t => {
+                const hasChildren = tags.children(t.tag_id).length > 0;
+                // 下位の分類があればさらにたどり、無ければその作業の動画一覧へ
+                const href = hasChildren ? `#/?work=${t.tag_id}` : `#/list?work=${t.tag_id}`;
+                return `<a href="${href}" class="work-button">${esc(t.name)}<span class="more">${hasChildren ? "さらに選ぶ ▶" : "動画を見る"}</span></a>`;
+            }).join("");
+            const allLink = current
+                ? `<a class="button primary" href="#/list?work=${current.tag_id}">「${esc(current.name)}」の動画をすべて見る</a>`
+                : `<a class="button primary" href="#/list">すべての動画を見る</a>`;
             app.innerHTML = `
                 <div class="section">
-                    <h2>技能伝承動画</h2>
-                    <p class="muted">熟練者の作業説明を動画で記録し、字幕・手順書・タグを自動で作ります。</p>
-                    <a class="button primary" href="#/upload">動画を撮影・投稿する</a>
+                    ${current ? breadcrumb(tags, workId, false) : ""}
+                    <h2>${current ? esc(current.name) : "作業の種類を選ぶ"}</h2>
+                    <div class="work-grid">${buttons || '<p class="muted">下位の分類はありません</p>'}</div>
+                    <p>${allLink}</p>
+                </div>
+                ${current ? "" : `
+                <div class="section">
+                    <h2>動画を増やす</h2>
+                    <p class="muted">熟練者が作業しながら説明する様子を撮影して投稿すると、字幕・手順書・タグが自動で作られます。</p>
+                    <a class="button primary" href="#/upload">📹 撮影・投稿する</a>
+                    <p class="muted" style="margin-top:12px"><a href="#/tags">タグ一覧の管理（PC向け）</a></p>
+                </div>`}`;
+        }
+
+        // --- 動画一覧（上部のタグボタンで絞り込み。複数選ぶと、すべてを持つ動画だけ） ---
+        function listHash(workId, tagIds) {
+            const q = new URLSearchParams();
+            if (workId) q.set("work", workId);
+            if (tagIds.length) q.set("tags", tagIds.join(","));
+            const qs = q.toString();
+            return `#/list${qs ? "?" + qs : ""}`;
+        }
+
+        function videoCard(v) {
+            const thumb = v.thumbnail_url ? `<img src="${BASE_URL}${v.thumbnail_url}" alt="" loading="lazy">` : `<div class="noimg"></div>`;
+            const chips = (v.video_tags || []).slice(0, 6).map(t => `<span class="chip">${esc(t.name)}</span>`).join("");
+            return `<a class="video-card" href="#/video/${v.video_id}">${thumb}
+                <div class="info"><div class="title">${esc(v.title)}</div>
+                <div class="muted">${clock(v.duration)}${v.explainer ? "　" + esc(v.explainer) : ""}</div>
+                <div class="chips">${chips}</div></div></a>`;
+        }
+
+        async function renderList(params) {
+            const workId = params.get("work") ? Number(params.get("work")) : null;
+            const selected = (params.get("tags") || "").split(",").filter(Boolean).map(Number);
+            let tags, data;
+            try {
+                tags = await loadTags();
+                data = await api(`/skill/api/videos?${new URLSearchParams({ ...(workId ? { work_tag: workId } : {}), tags: selected.join(",") })}`);
+            } catch (err) {
+                return showError(err);
+            }
+            const work = workId ? tags.byId[workId] : null;
+            // 絞り込みボタン: 表示中の動画に付いているタグ（＋選択中のタグ）を分類ごとに並べる
+            const facets = [...data.facets];
+            for (const id of selected) {
+                if (!facets.some(f => f.tag_id === id) && tags.byId[id]) facets.push({ ...tags.byId[id], count: 0 });
+            }
+            const groups = {};
+            for (const f of facets) {
+                if (f.tag_id === workId) continue;
+                (groups[f.category] ||= []).push(f);
+            }
+            const filterHtml = tags.categories.filter(c => groups[c]).map(c => `
+                <div class="filter-group"><div class="group-label">${esc(c)}</div><div class="chips">
+                ${groups[c].map(f => {
+                    const on = selected.includes(f.tag_id);
+                    const next = on ? selected.filter(id => id !== f.tag_id) : [...selected, f.tag_id];
+                    return `<a class="chip tag-filter ${on ? "selected" : ""}" href="${listHash(workId, next)}">${esc(f.name)}${on ? " ✕" : ` (${f.count})`}</a>`;
+                }).join("")}</div></div>`).join("");
+            app.innerHTML = `
+                <div class="section">
+                    ${breadcrumb(tags, workId, true)}
+                    <h2>${work ? esc(work.name) + " の動画" : "すべての動画"}（${data.videos.length}件）</h2>
+                    ${filterHtml ? `<p class="muted" style="margin:0 0 4px">タグで絞り込み（複数選ぶと、すべてに当てはまる動画だけ）</p>${filterHtml}` : ""}
+                    ${selected.length ? `<p><a class="button small" href="${listHash(workId, [])}">絞り込みを解除</a></p>` : ""}
+                </div>
+                <div class="section" id="video-list">
+                    ${data.videos.map(videoCard).join("") || '<p class="muted">該当する動画がありません</p>'}
                 </div>`;
         }
 
@@ -173,7 +306,12 @@
                         <progress id="upload-bar" max="100" value="0"></progress>
                     </div>
                     <div id="status-area"></div>
+                </div>
+                <div class="section">
+                    <h2>最近の投稿（処理の状況）</h2>
+                    <div id="recent-uploads" class="muted">読み込み中...</div>
                 </div>`;
+            loadRecentUploads();
             let selected = null;
             for (const id of ["camera-input", "file-input"]) {
                 document.getElementById(id).addEventListener("change", e => {
@@ -182,6 +320,23 @@
                 });
             }
             window.selectedFile = () => selected;
+        }
+
+        const STATUS_TEXT = { uploaded: "受付", media: "動画の変換中", transcribe: "文字起こし中", procedure: "手順書の作成中",
+                              tagging: "タグ付け中", done: "完了", error: "失敗" };
+
+        async function loadRecentUploads() {
+            const box = document.getElementById("recent-uploads");
+            try {
+                const data = await api("/skill/api/videos?include_unfinished=true");
+                box.innerHTML = data.videos.slice(0, 10).map(v =>
+                    `<a class="video-card" href="#/video/${v.video_id}"><div class="info"><div class="title">${esc(v.title)}</div>
+                     <span class="status-badge ${v.status === "error" ? "error" : ""}">${STATUS_TEXT[v.status] || esc(v.status)}</span>
+                     <span class="muted">${esc(v.created)}</span></div></a>`).join("") || "まだ投稿はありません";
+                box.classList.remove("muted");
+            } catch (err) {
+                box.textContent = "取得できませんでした: " + err.message;
+            }
         }
 
         function uploadVideo() {
@@ -254,6 +409,8 @@
                 area.innerHTML = renderStatus(video);
                 if (video.status !== "done" && video.status !== "error") {
                     pollTimer = setTimeout(() => pollStatus(videoId), 3000);
+                } else if (document.getElementById("recent-uploads")) {
+                    loadRecentUploads();
                 }
             } catch (err) {
                 area.innerHTML = `<p class="error">状況を取得できませんでした: ${esc(err.message)}</p>`;
@@ -267,6 +424,179 @@
                 pollStatus(videoId);
             } catch (err) {
                 alert("再実行できませんでした: " + err.message);
+            }
+        }
+
+        // --- タグ一覧の管理（PC想定）: 追加・編集・削除、別名の登録、新タグ候補の採用 ---
+        let tagState = null;
+
+        function parseAliases(text) {
+            return text.split(/[|｜、,，\n]/).map(a => a.trim()).filter(Boolean);
+        }
+
+        function tagOptions(filter, selectedId, emptyLabel) {
+            const rows = tagState.tags.filter(filter).map(t =>
+                `<option value="${t.tag_id}" ${t.tag_id === selectedId ? "selected" : ""}>${esc(tagState.ancestors(t.tag_id).map(a => a.name).join(" ＞ "))}</option>`);
+            return (emptyLabel ? [`<option value="">${emptyLabel}</option>`] : []).concat(rows).join("");
+        }
+
+        function categoryOptions(selected) {
+            return tagState.categories.map(c => `<option ${c === selected ? "selected" : ""}>${esc(c)}</option>`).join("");
+        }
+
+        async function renderTags(message) {
+            try {
+                tagState = await loadTags();
+                tagState.candidates = (await api("/skill/api/tag_candidates")).candidates;
+            } catch (err) {
+                return showError(err);
+            }
+            const depth = t => tagState.ancestors(t.tag_id).length - 1;
+            const ordered = [];
+            const walk = (parentId, category) => {
+                for (const t of tagState.tags.filter(t => t.parent_id === parentId && t.category === category)) {
+                    ordered.push(t);
+                    walk(t.tag_id, category);
+                }
+            };
+            const tables = tagState.categories.map(c => {
+                ordered.length = 0;
+                walk(null, c);
+                const rows = ordered.map(t => `<tr id="tag-row-${t.tag_id}">
+                    <td>${"　".repeat(depth(t))}${depth(t) ? "└ " : ""}${esc(t.name)}</td>
+                    <td>${t.aliases.map(esc).join("、")}</td><td>${t.video_count}</td>
+                    <td class="actions"><button class="small" onclick="editTag(${t.tag_id})">編集</button>
+                    <button class="small" onclick="deleteTag(${t.tag_id})">削除</button></td></tr>`).join("");
+                return `<h3>${esc(c)}</h3><table><tr><th>名前</th><th>別名</th><th>動画数</th><th></th></tr>${rows}</table>`;
+            }).join("");
+            const candidates = tagState.candidates.map(c => `<tr id="candidate-${c.candidate_id}">
+                <td><b>${esc(c.word)}</b></td><td>${esc(c.category || "")}</td><td>${esc(c.video_title || "")}</td>
+                <td class="actions"><button class="small primary" onclick="showAdopt(${c.candidate_id}, 'new')">新しいタグにする</button>
+                <button class="small" onclick="showAdopt(${c.candidate_id}, 'alias')">既存タグの別名にする</button>
+                <button class="small" onclick="rejectCandidate(${c.candidate_id})">却下</button>
+                <div id="adopt-${c.candidate_id}"></div></td></tr>`).join("");
+            app.innerHTML = `
+                ${message ? `<div class="notice">${esc(message)}</div>` : ""}
+                <div class="section">
+                    <h2>新タグ候補（タグ一覧に無い言葉）</h2>
+                    ${candidates ? `<table><tr><th>言葉</th><th>分類</th><th>動画</th><th></th></tr>${candidates}</table>`
+                                 : '<p class="muted">保留中の候補はありません</p>'}
+                    <p><button onclick="rematchAll()">全動画のタグを付け直す</button>
+                    <span class="muted">タグや別名を変えた後に押すと、これまでの動画にも反映されます（AIは使いません）</span></p>
+                </div>
+                <div class="section" id="tag-form-section">
+                    <h2 id="tag-form-title">タグを追加</h2>
+                    <div class="form-row">
+                        <div><label for="tag-name">名前</label><input type="text" id="tag-name"></div>
+                        <div><label for="tag-category">分類</label><select id="tag-category" onchange="refreshParentOptions()">${categoryOptions("作業")}</select></div>
+                        <div><label for="tag-parent">親（上位の分類）</label><select id="tag-parent"></select></div>
+                    </div>
+                    <label for="tag-aliases">別名（「|」や「、」で区切る）</label>
+                    <input type="text" id="tag-aliases" placeholder="例: 型枠の組立|建て込み">
+                    <p><button class="primary" id="tag-save" onclick="saveTag()">追加する</button>
+                    <button id="tag-cancel" style="display:none" onclick="renderTags()">編集をやめる</button></p>
+                    <input type="hidden" id="tag-id">
+                </div>
+                <div class="section"><h2>タグ一覧</h2>${tables}</div>`;
+            refreshParentOptions();
+        }
+
+        function refreshParentOptions(selectedId) {
+            const category = document.getElementById("tag-category").value;
+            const editingId = Number(document.getElementById("tag-id").value) || null;
+            document.getElementById("tag-parent").innerHTML =
+                tagOptions(t => t.category === category && t.tag_id !== editingId, selectedId, "（なし）");
+        }
+
+        function editTag(tagId) {
+            const t = tagState.byId[tagId];
+            document.getElementById("tag-id").value = tagId;
+            document.getElementById("tag-form-title").textContent = `タグを編集: ${t.name}`;
+            document.getElementById("tag-name").value = t.name;
+            document.getElementById("tag-category").value = t.category;
+            document.getElementById("tag-aliases").value = t.aliases.join("|");
+            refreshParentOptions(t.parent_id);
+            document.getElementById("tag-save").textContent = "保存する";
+            document.getElementById("tag-cancel").style.display = "inline-block";
+            document.getElementById("tag-form-section").scrollIntoView({ behavior: "smooth" });
+        }
+
+        async function saveTag() {
+            const tagId = document.getElementById("tag-id").value;
+            const parent = document.getElementById("tag-parent").value;
+            const body = JSON.stringify({
+                name: document.getElementById("tag-name").value,
+                category: document.getElementById("tag-category").value,
+                parent_id: parent ? Number(parent) : null,
+                aliases: parseAliases(document.getElementById("tag-aliases").value),
+            });
+            try {
+                await api(tagId ? `/skill/api/tags/${tagId}` : "/skill/api/tags", { method: tagId ? "PUT" : "POST", body });
+                renderTags(tagId ? "タグを保存しました" : "タグを追加しました");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        async function deleteTag(tagId) {
+            const t = tagState.byId[tagId];
+            if (!confirm(`「${t.name}」を削除しますか？（${t.video_count}本の動画から外れます）`)) return;
+            try {
+                await api(`/skill/api/tags/${tagId}`, { method: "DELETE" });
+                renderTags("タグを削除しました");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        function showAdopt(candidateId, mode) {
+            const c = tagState.candidates.find(c => c.candidate_id === candidateId);
+            const box = document.getElementById(`adopt-${candidateId}`);
+            if (mode === "new") {
+                const category = tagState.categories.includes(c.category) ? c.category : "作業";
+                box.innerHTML = `<div class="inline-form form-row">
+                    <div><label>名前</label><input type="text" id="adopt-name-${candidateId}" value="${esc(c.word)}"></div>
+                    <div><label>分類</label><select id="adopt-category-${candidateId}">${categoryOptions(category)}</select></div>
+                    <div><label>親</label><select id="adopt-parent-${candidateId}">${tagOptions(t => t.category === category, null, "（なし）")}</select></div>
+                    <div><button class="primary small" onclick="adopt(${candidateId}, 'new')">採用する</button></div></div>`;
+                document.getElementById(`adopt-category-${candidateId}`).addEventListener("change", e => {
+                    document.getElementById(`adopt-parent-${candidateId}`).innerHTML = tagOptions(t => t.category === e.target.value, null, "（なし）");
+                });
+            } else {
+                box.innerHTML = `<div class="inline-form form-row">
+                    <div><label>別名を追加するタグ</label><select id="adopt-tag-${candidateId}">${tagOptions(t => t.category !== "難易度", null, "選んでください")}</select></div>
+                    <div><button class="primary small" onclick="adopt(${candidateId}, 'alias')">別名にする</button></div></div>`;
+            }
+        }
+
+        async function adopt(candidateId, mode) {
+            const value = id => document.getElementById(`${id}-${candidateId}`).value;
+            const body = mode === "new"
+                ? { mode, name: value("adopt-name"), category: value("adopt-category"), parent_id: value("adopt-parent") ? Number(value("adopt-parent")) : null }
+                : { mode, tag_id: value("adopt-tag") ? Number(value("adopt-tag")) : null };
+            try {
+                await api(`/skill/api/tag_candidates/${candidateId}/adopt`, { method: "POST", body: JSON.stringify(body) });
+                renderTags("採用しました。「全動画のタグを付け直す」を押すと、これまでの動画にも反映されます");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        async function rejectCandidate(candidateId) {
+            try {
+                await api(`/skill/api/tag_candidates/${candidateId}/reject`, { method: "POST" });
+                renderTags("却下しました（同じ言葉は今後候補に出ません）");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        async function rematchAll() {
+            try {
+                const res = await api("/skill/api/rematch", { method: "POST" });
+                renderTags(`${res.videos}本の動画のタグを付け直しました`);
+            } catch (err) {
+                alert(err.message);
             }
         }
 

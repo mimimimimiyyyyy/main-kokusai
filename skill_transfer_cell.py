@@ -18,6 +18,7 @@
 
 import os, re, csv, json, shutil, sqlite3, inspect, threading, traceback, subprocess
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 
@@ -1221,7 +1222,180 @@ SKILL_STEPS = [("media", step_media), ("transcribe", step_transcribe), ("procedu
 SKILL_STEP_NAMES = [name for name, _ in SKILL_STEPS]
 
 
-# --- 10. API（/skill/api/...） ---
+# --- 10. ④ 閲覧（作業の種類・タグでの絞り込み）とタグ一覧の管理 ---
+def descendant_tag_ids(conn, tag_id):
+    """そのタグと、下位の分類（子・孫…）のタグのID。"""
+    rows = conn.execute(
+        """WITH RECURSIVE sub(id) AS (
+               SELECT ? UNION SELECT t.id FROM skill_tags t JOIN sub ON t.parent_id = sub.id)
+           SELECT id FROM sub""",
+        (tag_id,)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def search_videos(conn, work_tag_id=None, tag_ids=(), include_unfinished=False):
+    """
+    ④ の1〜2: 作業の種類が選ばれたら、その分類（下位の分類を含む）の動画タグを持つ動画。
+    タグが選ばれたら、選ばれたタグをすべて持つ動画だけ（AND検索）。
+    """
+    sql = f"SELECT {', '.join(VIDEO_COLUMNS)} FROM skill_videos WHERE 1=1"
+    params = []
+    if not include_unfinished:
+        sql += " AND status='done'"
+    if work_tag_id is not None:
+        ids = descendant_tag_ids(conn, work_tag_id)
+        sql += f""" AND id IN (SELECT video_id FROM skill_annotations
+                               WHERE layer='video_tag' AND tag_id IN ({','.join('?' * len(ids))}))"""
+        params += ids
+    tag_ids = sorted(set(tag_ids))
+    if tag_ids:
+        sql += f""" AND id IN (SELECT video_id FROM skill_annotations
+                               WHERE layer='video_tag' AND tag_id IN ({','.join('?' * len(tag_ids))})
+                               GROUP BY video_id HAVING COUNT(DISTINCT tag_id) = ?)"""
+        params += tag_ids + [len(tag_ids)]
+    rows = conn.execute(sql + " ORDER BY created DESC, id DESC", params).fetchall()
+    return [dict(zip(VIDEO_COLUMNS, r)) for r in rows]
+
+
+class TagBody(BaseModel):
+    name: str
+    category: str
+    parent_id: Optional[int] = None
+    aliases: list[str] = []
+
+
+def clean_tag_body(conn, body, tag_id=None):
+    """タグの追加・編集の内容を確かめて整える。問題があれば ValueError。"""
+    name = body.name.strip()
+    if not name:
+        raise ValueError("タグの名前を入力してください")
+    if body.category not in TAG_CATEGORIES:
+        raise ValueError(f"分類は {'・'.join(TAG_CATEGORIES)} のいずれかにしてください")
+    same = conn.execute("SELECT id FROM skill_tags WHERE name=?", (name,)).fetchone()
+    if same and same[0] != tag_id:
+        raise ValueError(f"「{name}」は既にあります")
+    if body.parent_id is not None:
+        parent = conn.execute("SELECT category FROM skill_tags WHERE id=?", (body.parent_id,)).fetchone()
+        if parent is None:
+            raise ValueError("親のタグが見つかりません")
+        if parent[0] != body.category:
+            raise ValueError("親には同じ分類のタグを選んでください")
+        if tag_id is not None and body.parent_id in descendant_tag_ids(conn, tag_id):
+            raise ValueError("自分自身や下位のタグを親にはできません")
+    aliases = []
+    for a in body.aliases:
+        a = a.strip()
+        if a and a != name and a not in aliases:
+            aliases.append(a)
+    return name, body.category, body.parent_id, aliases
+
+
+def save_tag(conn, body, tag_id=None):
+    name, category, parent_id, aliases = clean_tag_body(conn, body, tag_id)
+    aliases_json = json.dumps(aliases, ensure_ascii=False)
+    if tag_id is None:
+        tag_id = conn.execute(
+            "INSERT INTO skill_tags (name, category, parent_id, aliases, created) VALUES (?,?,?,?,?)",
+            (name, category, parent_id, aliases_json, now_str())
+        ).lastrowid
+    else:
+        conn.execute("UPDATE skill_tags SET name=?, category=?, parent_id=?, aliases=? WHERE id=?",
+                     (name, category, parent_id, aliases_json, tag_id))
+        # 名前を変えたら、付いている場面タグ・動画タグの表示名もそろえる
+        conn.execute("UPDATE skill_annotations SET label=? WHERE tag_id=?", (name, tag_id))
+    conn.commit()
+    return tag_id
+
+
+def delete_tag(conn, tag_id):
+    """下位のタグがあるときは消さない（先に下位のタグを消すか付け替える）。付いている場面タグ・動画タグも消す。"""
+    if conn.execute("SELECT COUNT(*) FROM skill_tags WHERE parent_id=?", (tag_id,)).fetchone()[0]:
+        raise ValueError("下位のタグがあるため削除できません")
+    conn.execute("DELETE FROM skill_annotations WHERE tag_id=?", (tag_id,))
+    conn.execute("DELETE FROM skill_tags WHERE id=?", (tag_id,))
+    conn.commit()
+
+
+def tag_video_counts(conn):
+    return dict(conn.execute(
+        """SELECT a.tag_id, COUNT(DISTINCT a.video_id) FROM skill_annotations a
+           JOIN skill_videos v ON v.id = a.video_id
+           WHERE a.layer='video_tag' AND v.status='done' GROUP BY a.tag_id"""
+    ).fetchall())
+
+
+def list_tag_candidates(conn, status="pending"):
+    rows = conn.execute(
+        """SELECT c.id, c.word, c.category, c.status, c.created, c.video_id, v.title
+           FROM skill_tag_candidates c LEFT JOIN skill_videos v ON v.id = c.video_id
+           WHERE c.status=? ORDER BY c.id""",
+        (status,)
+    ).fetchall()
+    return [{"candidate_id": r[0], "word": r[1], "category": r[2], "status": r[3], "created": r[4],
+             "video_id": r[5], "video_title": r[6]} for r in rows]
+
+
+class AdoptBody(BaseModel):
+    mode: str                      # "new"（新しいタグにする）/ "alias"（既存タグの別名にする）
+    name: Optional[str] = None
+    category: Optional[str] = None
+    parent_id: Optional[int] = None
+    tag_id: Optional[int] = None
+
+
+def adopt_candidate(conn, candidate_id, body):
+    row = conn.execute("SELECT word, category, status FROM skill_tag_candidates WHERE id=?",
+                       (candidate_id,)).fetchone()
+    if row is None:
+        raise LookupError("候補が見つかりません")
+    word, category, status = row
+    if status != "pending":
+        raise ValueError("この候補は処理済みです")
+    if body.mode == "new":
+        tag_id = save_tag(conn, TagBody(name=body.name or word, category=body.category or category or "作業",
+                                        parent_id=body.parent_id,
+                                        aliases=[word] if body.name and body.name != word else []))
+    elif body.mode == "alias":
+        tag = conn.execute("SELECT id, name, category, parent_id, aliases FROM skill_tags WHERE id=?",
+                           (body.tag_id,)).fetchone()
+        if tag is None:
+            raise ValueError("別名を追加するタグを選んでください")
+        current = tag_row_to_dict(tag)
+        tag_id = save_tag(conn, TagBody(name=current["name"], category=current["category"],
+                                        parent_id=current["parent_id"], aliases=current["aliases"] + [word]),
+                          tag_id=current["tag_id"])
+    else:
+        raise ValueError("mode は new か alias を指定してください")
+    conn.execute("UPDATE skill_tag_candidates SET status='adopted' WHERE id=?", (candidate_id,))
+    conn.commit()
+    return tag_id
+
+
+def rematch_video_tags(ctx, video_id):
+    """
+    タグ一覧を変えた後に、保存済みの抽出結果（LLMの出力）を使ってタグを付け直す。
+    LLMはもう一度呼ばない（費用と時間がかからない）。
+    """
+    row = ctx.conn.execute(
+        "SELECT result FROM skill_llm_results WHERE video_id=? AND kind='tag_terms' ORDER BY id DESC LIMIT 1",
+        (video_id,)
+    ).fetchone()
+    steps = get_steps(ctx.conn, video_id)
+    if row is None or not steps:
+        return False
+    result = validate_tag_terms(parse_json_text(json.loads(row[0])["raw"]), len(steps))
+    step_terms = {item.step_index: list(item.terms) for item in result.steps}
+    for i, step in enumerate(steps):
+        step_terms.setdefault(i, []).extend(
+            [{"word": w, "category": "道具"} for w in step.get("tools", [])]
+            + [{"word": w, "category": "資材"} for w in step.get("materials", [])])
+    assign_tags(ctx.conn, video_id, steps, step_terms, f"rematch@{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                difficulty=ctx.difficulty)
+    return True
+
+
+# --- 11. API（/skill/api/...） ---
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
@@ -1283,6 +1457,88 @@ def create_skill_router(ctx):
             shutil.copyfileobj(file.file, f)
         start_skill_pipeline(ctx, video_id)
         return {"video_id": video_id, "status": get_skill_video(ctx.conn, video_id)["status"]}
+
+    @router.get("/skill/api/videos")
+    def api_skill_videos(work_tag: Optional[int] = None, tags: str = "", include_unfinished: bool = False):
+        try:
+            tag_ids = [int(t) for t in tags.split(",") if t.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="tags はタグIDのカンマ区切りで指定してください")
+        videos = search_videos(ctx.conn, work_tag, tag_ids, include_unfinished)
+        result = []
+        facet_counts = {}
+        for v in videos:
+            video_tags = get_video_tags(ctx.conn, v["id"])
+            for t in video_tags:
+                facet_counts.setdefault(t["tag_id"], {**t, "count": 0})["count"] += 1
+            thumb = os.path.join(video_dir(v["id"], ctx.media_dir), "thumbnail.jpg")
+            result.append({**video_summary(v), "video_tags": video_tags,
+                           "thumbnail_url": f"/skill/api/videos/{v['id']}/thumbnail.jpg" if os.path.exists(thumb) else None})
+        # 絞り込みボタン用: いま表示している動画に付いているタグと、その動画数
+        facets = sorted(facet_counts.values(), key=lambda t: (TAG_CATEGORIES.index(t["category"])
+                                                              if t["category"] in TAG_CATEGORIES else 99, -t["count"], t["name"]))
+        return {"videos": result, "facets": facets}
+
+    @router.get("/skill/api/tags")
+    def api_skill_tags():
+        counts = tag_video_counts(ctx.conn)
+        return {"categories": TAG_CATEGORIES,
+                "tags": [{**t, "video_count": counts.get(t["tag_id"], 0)} for t in list_skill_tags(ctx.conn)]}
+
+    @router.post("/skill/api/tags")
+    def api_skill_tag_create(body: TagBody):
+        try:
+            return {"tag_id": save_tag(ctx.conn, body)}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @router.put("/skill/api/tags/{tag_id}")
+    def api_skill_tag_update(tag_id: int, body: TagBody):
+        if ctx.conn.execute("SELECT id FROM skill_tags WHERE id=?", (tag_id,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail="タグが見つかりません")
+        try:
+            return {"tag_id": save_tag(ctx.conn, body, tag_id)}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @router.delete("/skill/api/tags/{tag_id}")
+    def api_skill_tag_delete(tag_id: int):
+        if ctx.conn.execute("SELECT id FROM skill_tags WHERE id=?", (tag_id,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail="タグが見つかりません")
+        try:
+            delete_tag(ctx.conn, tag_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return {"status": "deleted", "tag_id": tag_id}
+
+    @router.get("/skill/api/tag_candidates")
+    def api_skill_tag_candidates(status: str = "pending"):
+        return {"candidates": list_tag_candidates(ctx.conn, status)}
+
+    @router.post("/skill/api/tag_candidates/{candidate_id}/adopt")
+    def api_skill_candidate_adopt(candidate_id: int, body: AdoptBody):
+        try:
+            return {"status": "adopted", "tag_id": adopt_candidate(ctx.conn, candidate_id, body)}
+        except LookupError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @router.post("/skill/api/tag_candidates/{candidate_id}/reject")
+    def api_skill_candidate_reject(candidate_id: int):
+        cur = ctx.conn.execute("UPDATE skill_tag_candidates SET status='rejected' WHERE id=? AND status='pending'",
+                               (candidate_id,))
+        ctx.conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="保留中の候補が見つかりません")
+        return {"status": "rejected"}
+
+    @router.post("/skill/api/rematch")
+    # タグ一覧を変えた後、全動画のタグを付け直す（保存済みの抽出結果を使い、LLMは呼ばない）
+    def api_skill_rematch():
+        done = [v["id"] for v in search_videos(ctx.conn) if v["id"] not in ctx.running]
+        updated = sum(1 for video_id in done if rematch_video_tags(ctx, video_id))
+        return {"status": "done", "videos": updated}
 
     @router.get("/skill/api/videos/{video_id}")
     def api_skill_video(video_id: int):
@@ -1373,7 +1629,7 @@ def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=No
     return ctx
 
 
-# --- 11. 既存セルのサーバー起動時に自動で登録する仕組み ---
+# --- 12. 既存セルのサーバー起動時に自動で登録する仕組み ---
 def install_skill_transfer_hook(namespace=None):
     """
     uvicorn.Server.serve を包み、サーバー起動の直前に register_skill_transfer を呼ぶ。
