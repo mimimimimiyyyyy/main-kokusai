@@ -10,6 +10,7 @@ Colab専用の行を含むため普通には import できない。ここでは
 """
 import os
 import sqlite3
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -40,8 +41,10 @@ def cell_source(path, stop_marker=None, replacements=None):
     return "\n".join(lines) + "\n"
 
 
-def exec_cell(source, name, namespace=None):
-    module = types.ModuleType(name)
+def exec_cell(source, name, namespace=None, module=None):
+    """module を渡すと、そのモジュールの変数の置き場で実行する（Colabでセル同士が変数を共有するのと同じ）。"""
+    if module is None:
+        module = types.ModuleType(name)
     if namespace:
         module.__dict__.update(namespace)
     exec(compile(source, name, "exec"), module.__dict__)
@@ -102,7 +105,7 @@ def _pipeline_stub_modules():
     }
 
 
-def load_pipeline_cell(db_path, namespace=None):
+def load_pipeline_cell(db_path, namespace=None, module=None):
     """
     既存セルを、サーバー起動の手前まで読み込む。namespaceに関数を入れておくと、
     Colabで先に別セルを実行した状態（例: register_skill_transfer が定義済み）を再現できる。
@@ -118,7 +121,7 @@ def load_pipeline_cell(db_path, namespace=None):
     saved = {name: sys.modules.get(name) for name in stubs}
     sys.modules.update(stubs)
     try:
-        return exec_cell(source, "audio_analysis_pipeline", namespace)
+        return exec_cell(source, "audio_analysis_pipeline", namespace, module)
     finally:
         for name, module in saved.items():
             if module is None:
@@ -144,3 +147,82 @@ def conn(skill):
 def seeded_conn(skill, conn):
     skill.seed_skill_tags(conn, str(SEED_CSV))
     return conn
+
+
+def load_cells_in_colab_order(db_path):
+    """Colabと同じく「技能伝承セル → 既存セル」の順に、同じ変数の置き場で実行する。"""
+    shared = load_skill_cell()
+    load_pipeline_cell(db_path, module=shared)
+    return shared
+
+
+def make_sample_video(path, seconds=3, audio=True):
+    """テスト用の短い動画（カラーバー＋440Hzの音）を ffmpeg で作る。"""
+    args = ["ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"testsrc=size=320x240:rate=15:duration={seconds}"]
+    if audio:
+        args += ["-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=44100:duration={seconds}",
+                 "-c:a", "aac"]
+    args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-shortest", str(path)]
+    subprocess.run(args, check=True)
+    return path
+
+
+@pytest.fixture(scope="session")
+def sample_video(tmp_path_factory):
+    return make_sample_video(tmp_path_factory.mktemp("media") / "sample.mp4")
+
+
+@pytest.fixture(scope="session")
+def silent_video(tmp_path_factory):
+    return make_sample_video(tmp_path_factory.mktemp("media") / "no_audio.mp4", audio=False)
+
+
+class FakeWhisperModel:
+    """
+    openai-whisper のモデルの代わり。transcribe の引数を記録し、決まったセグメントを返す。
+    引数の形は carry_initial_prompt に対応した新しい版の whisper.transcribe と同じ。
+    """
+
+    def __init__(self, segments=None, error=None):
+        self.segments = segments if segments is not None else default_whisper_segments()
+        self.error = error
+        self.calls = []
+
+    def transcribe(self, audio, *, temperature=(0.0,), word_timestamps=False,
+                   condition_on_previous_text=True, initial_prompt=None,
+                   carry_initial_prompt=False, **decode_options):
+        self.calls.append({
+            "audio": audio, "temperature": temperature, "word_timestamps": word_timestamps,
+            "condition_on_previous_text": condition_on_previous_text, "initial_prompt": initial_prompt,
+            "carry_initial_prompt": carry_initial_prompt, **decode_options,
+        })
+        if self.error:
+            raise self.error
+        return {"segments": self.segments}
+
+
+class OldFakeWhisperModel(FakeWhisperModel):
+    """carry_initial_prompt が無い古い版の whisper の代わり。"""
+
+    def transcribe(self, audio, *, temperature=(0.0,), word_timestamps=False,
+                   condition_on_previous_text=True, initial_prompt=None, **decode_options):
+        return super().transcribe(audio, temperature=temperature, word_timestamps=word_timestamps,
+                                  condition_on_previous_text=condition_on_previous_text,
+                                  initial_prompt=initial_prompt, **decode_options)
+
+
+def whisper_segment(start, end, words, **extra):
+    """words: [(単語, 開始, 終了), ...] からWhisperのセグメントを作る。"""
+    return {
+        "start": start, "end": end, "text": "".join(w for w, _, _ in words),
+        "words": [{"word": w, "start": s, "end": e} for w, s, e in words],
+        "no_speech_prob": 0.01, "avg_logprob": -0.2, "compression_ratio": 1.2, **extra,
+    }
+
+
+def default_whisper_segments():
+    return [
+        whisper_segment(0.0, 2.0, [("まず", 0.0, 0.4), ("型枠を", 0.4, 1.0), ("立てます。", 1.0, 2.0)]),
+        whisper_segment(2.0, 3.0, [("次は", 2.0, 2.4), ("セパを", 2.4, 2.7), ("入れます。", 2.7, 3.0)]),
+    ]

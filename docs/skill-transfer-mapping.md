@@ -54,9 +54,9 @@ CLAUDE.md「作業0」の成果物。コードはまだ書いていない。
 
 | 処理 | 実装 | 技能伝承での再利用性 |
 | --- | --- | --- |
-| 動画アップロード → 非同期ジョブ | `POST /upload` → スレッドで処理、`GET /jobs/{job_id}` でポーリング（ngrok のタイムアウト対策） | **方式をそのまま流用**。`jobs` 辞書と `/jobs/{job_id}` も共用できる |
+| 動画アップロード → 非同期ジョブ | `POST /upload` → スレッドで処理、`GET /jobs/{job_id}` でポーリング（ngrok のタイムアウト対策） | **方式を流用**（すぐ ID を返し、裏で処理、画面はポーリング）。状態はメモリでなく `skill_videos` に保存し、再起動後も確認・再実行できるようにする |
 | 音声取り出し | pydub で 16kHz・モノラル・正規化 → WAV 書き出し | **流用**（ffmpeg を直接呼ぶ必要なし）。騒音除去だけ追加 |
-| 文字起こし | `transcribe_full_audio()`：全体を 1 回で Whisper に通す、単語タイムスタンプ、幻覚・繰り返し除去 | **流用**。実データで調整済みのフィルタをそのまま活かす |
+| 文字起こし | `transcribe_full_audio()`：全体を 1 回で Whisper に通す、単語タイムスタンプ、幻覚・繰り返し除去 | **読み込み済みの Whisper モデルを共用し、同じ設定・同じフィルタを技能伝承セルに複製**（言語指定・用語ヒントを足すため。既存関数は編集しない）。精度ツールと同じく「変更したら両方に反映」と注記する |
 | 話者分離 | pyannote（4 人固定） | **使わない**。説明者 1 人の作業動画なので不要（4 人固定だと誤分割する） |
 | 匿名化 | `extract_mask_targets_with_gpt()` で固有名詞を `[MASK]` 置換 | 使うかどうか要判断（Q5） |
 | 発話ラベル付け | `tag_turns_with_gpt()`（phase / intent） | 使わない（対話研究用のラベル体系） |
@@ -84,7 +84,7 @@ CLAUDE.md「作業0」の成果物。コードはまだ書いていない。
 | 新タグ候補 | — | 無い | **新規**：`skill_tag_candidates` |
 | タグでの絞り込み | 既存の検索・フィルタ | 既存は埋め込みによる意味検索のみ。タグ・分類での絞り込みは無い | **新規**：AND 絞り込み・分類の下位を含む一覧の API |
 | 手順書 | 新規（LLM → PDF） | — | **新規**。LLM 結果の原本は `addin_results` と同じ形の `skill_llm_results`（版つき）に残す＝既存の再分析の考え方を流用 |
-| 処理状況・再実行 | — | メモリ上の `jobs` のみ | **流用＋拡張**：進捗表示は既存 `jobs`/`/jobs/{id}` を共用、失敗状態とエラーは `skill_videos` に永続化して再実行可能にする |
+| 処理状況・再実行 | — | メモリ上の `jobs` のみ | **新規**：処理状態・失敗した段階・エラー内容を `skill_videos` に保存し、画面から再実行できるようにする |
 
 ---
 
@@ -188,22 +188,21 @@ tests/                       # pytest（新規導入）。LLM・音声認識は�
 README.md
 ```
 
-**Colab での実行順**（既存セルの中身はほぼそのまま）
+**既存ファイルは編集しない**（ご指示）。`audio_analysis_pipeline.py`・`transcription_accuracy_tool.py` は 1 行も変えず、技能伝承の処理はすべて新しいファイルに書く。
+
+**Colab での実行順**
 
 1. `skill_transfer_cell.py` を貼ったセルを実行（関数と設定の定義だけ。モデル読み込みやサーバー起動はしない）
-2. 既存の `audio_analysis_pipeline.py` のセルを実行
+2. 既存の `audio_analysis_pipeline.py` のセルを **いつもどおり** 実行
 
-既存セルの「5. サーバー起動」の直前に、次の **数行だけを追加** する。技能伝承セルを実行していなければ何もしないので、**今までどおり既存セルだけを動かしたときの動作は変わらない**。
+既存セルは最後にサーバーを起動したまま止まる（`await server.serve()`）ため、後から別セルで API を足すことはできない。
+そこで技能伝承セルは、uvicorn のサーバー起動処理（`uvicorn.Server.serve`）に「起動の直前に技能伝承の API を `app` に登録する」処理を差し込んでおく。
+Colab ではセル同士が同じ変数の置き場を共有しているので、起動の時点で既存セルが作った `app`・`whisper_model`・`client`・`extract_mask_targets_with_gpt` をそのまま受け取れる。
 
-```python
-# --- 4.5 技能伝承機能（skill_transfer_cell.py を先に実行した場合のみ有効） ---
-if "register_skill_transfer" in globals():
-    register_skill_transfer(app, conn, jobs, jobs_lock,
-                            transcribe_fn=transcribe_full_audio, openai_client=client)
-```
-
-既存のサーバー起動はセルの最後で処理が止まる（`await server.serve()`）ため、後から別セルで API を足すことができない。そのため「技能伝承セルを先に実行し、既存セルの最後で登録する」順にしている。
-既存の Whisper 設定・幻覚フィルタ（`transcribe_full_audio`）や OpenAI クライアントは引数で受け取るので、そのまま使いつつ、テストではモックに差し替えられる。
+- 技能伝承セルを実行しなければ何も差し込まれないので、**既存セルだけを動かしたときの動作は今と同じ**
+- 登録に失敗しても、エラーを表示したうえで既存のサーバーはそのまま起動する
+- 既存の Whisper モデル（GPU に載っているもの）・OpenAI クライアントを共用するので、モデルを二重に読み込まない
+- DB は既存と同じ `corpus.db` に、技能伝承セル側で別の接続を開いて `skill_` の表だけを読み書きする
 
 **画面の配信**：`kokusai.html` のようにファイルを開いて ngrok URL に `fetch` する方式は、スマホでは HTML ファイルを開く手段が無いうえ、`<video>` タグには `ngrok-skip-browser-warning` ヘッダを付けられず ngrok の警告ページで再生が止まる。
 そのため `skill_transfer.html` は書き方を `kokusai.html` に揃えたうえで、**FastAPI から `/skill` で配信**し、スマホでは「ngrok URL/skill」を開く（初回だけ「Visit Site」を押せば以後は動画も再生できる）。
@@ -211,7 +210,7 @@ if "register_skill_transfer" in globals():
 
 **テストの方法**：セルファイルは `!pip install` 行があるため、そのままは import できない。`tests/conftest.py` に「`!` で始まる行を除いて読み込むローダー」を用意し、
 - `skill_transfer_cell.py`：そのまま読み込んでテスト（重い処理は引数で注入するため、スタブは LLM・音声認識だけ）
-- `audio_analysis_pipeline.py`（既存 API の回帰確認）：同じローダーで、torch・whisper・pyannote・colab などをスタブにし、DB パスを一時ファイルに置き換え、「5. サーバー起動」以降を除いて読み込む。`/corpus`・`/search` などが技能伝承の追加前と同じ結果を返すことを確かめる
+- `audio_analysis_pipeline.py`（既存 API の回帰確認）：同じローダーで、torch・whisper・pyannote・colab などをスタブにし、DB パスを一時ファイルに置き換え、「5. サーバー起動」以降を除いて読み込む。技能伝承セルと同じ変数の置き場で読み込むことで Colab の実行順を再現し、既存の API がすべて残ること、`/corpus` などが技能伝承の追加前と同じ結果を返すことを確かめる
 
 この方法なら、テストのために既存コードを書き換える必要はない（前回提案した `CORPUS_DB_PATH` の変更は取り下げる）。
 
@@ -219,8 +218,8 @@ if "register_skill_transfer" in globals():
 
 | 区分 | 内容 |
 | --- | --- |
-| 流用 | `sessions`・`turns`・`addin_results` の列構成（新しい表の手本）、`transcribe_full_audio()`、pydub による音声変換・正規化、ジョブ ID＋ポーリング方式と `jobs`/`/jobs/{id}`、OpenAI クライアント（Q2 次第）、pydantic、FastAPI の `app` |
-| 拡張 | `audio_analysis_pipeline.py` のサーバー起動直前に登録の数行を追加（5.2）。既存の表・既存 API は変更しない（Q1＝B 案）。Q6 は任意 |
+| 流用 | `sessions`・`turns`・`addin_results` の列構成（新しい表の手本）、読み込み済みの Whisper モデルと `transcribe_full_audio()` の設定・フィルタ、pydub による音声変換・正規化、ID を返してポーリングする方式、OpenAI クライアント、匿名化関数（設定で ON のとき）、pydantic、FastAPI の `app` |
+| 拡張 | なし。既存ファイル・既存の表・既存 API はいずれも変更しない（5.2、Q1＝B 案） |
 | 新規 | `skill_transfer_cell.py`・`skill_transfer.html`、上記 6 テーブル、騒音除去、文分割、WebVTT、LLM 呼び出しの集約、手順分割＋検証＋再試行、PDF、タグ照合（rapidfuzz）、タグ絞り込み API、動画ファイル配信、画面一式、seed CSV、pytest、`.env.example`、README |
 
 ### 5.4 各段階の作業とテスト
@@ -272,16 +271,15 @@ CLAUDE.md と方針資料を突き合わせ、計画に次の点を反映・確�
 
 **Q3. 画面（フロントエンド）** → **回答済み**：既存は単一 HTML（`kokusai.html`）。同じ書き方で `skill_transfer.html` を作り、スマホから開けるよう FastAPI から配信する（5.2）。`kokusai.html` には手を入れない。
 
-**Q4. コードの置き方** → **回答済み**：Colab はセルに貼り付け。技能伝承は別セル `skill_transfer_cell.py` にし、既存セルにはサーバー起動直前の登録の数行だけを追加する（5.2）。
+**Q4. コードの置き方** → **回答済み**：Colab はセルに貼り付け。技能伝承は別セル `skill_transfer_cell.py` にし、既存セルは編集しない（技能伝承セルを先に実行すると、既存セルのサーバー起動時に自動で登録される。5.2）。
 テストは pytest を新たに導入し、セルファイルを読み込むローダーで既存 API の回帰確認も行う（既存コードの書き換えは不要）。
 
 **Q5. 匿名化を技能伝承動画にもかけるか**
 既存の `[MASK]` 置換は、道具の商品名・メーカー名・現場名まで伏せる可能性があり、手順書やタグ付けの質が落ちます。推奨は**既定 OFF（設定で ON 可）**。個人名を伏せる必要があれば ON にします。
 
-**Q6. Whisper の言語指定と専門用語ヒント**
-既存の `transcribe_full_audio()` は言語自動判定で、語彙のヒントも渡せません。騒音の多い現場音声での誤判定と、専門用語の誤認識（方針資料の課題）への対策として、
-**省略可能な引数 `language=None`, `initial_prompt=None` を追加**（既定は今と同じ動作＝対話研究側の結果は変わらない）し、技能伝承からは `"ja"` とタグ一覧の用語を渡したいです。
-注意：既存は `condition_on_previous_text=False` なので、openai-whisper の版によっては `initial_prompt` が最初の 30 秒にしか効きません。全体に効かせる `carry_initial_prompt` が使える版かを段階 2 で確認し、使えない場合はその旨を報告します。不可なら自動判定のまま使います。
+**Q6. Whisper の言語指定と専門用語ヒント** → **回答済み（既存ファイルは編集しない形に変更）**
+既存の `transcribe_full_audio()` には引数を足さず、技能伝承セルに同じ設定・同じフィルタの関数を作り、そこで言語（`ja`）とタグ一覧の用語ヒント（`initial_prompt`）を渡す。Whisper モデルは既存セルで読み込んだものを共用する。
+既存は `condition_on_previous_text=False` なので、openai-whisper の版によっては `initial_prompt` が最初の 30 秒にしか効かない。全体に効かせる `carry_initial_prompt` がある版では自動で使う。
 
 **Q7. タグ一覧の初期データ**
 実際に使うタグ（作業の分類・道具・資材など）の一覧があれば `seed/skill_transfer_tags.csv` に使います。無ければ、型枠・鉄筋・内装などのサンプルを私が作ります。
