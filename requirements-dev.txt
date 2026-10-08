@@ -1,0 +1,16 @@
+# テスト実行用（ローカルで pytest を動かすためのもの。Colabでは各セル冒頭の !pip install を使う）
+# 既存セル（audio_analysis_pipeline.py）のGPUモデル・Colab専用ライブラリはテストでスタブに差し替えるため不要。
+pytest
+fastapi
+uvicorn
+python-multipart
+httpx
+pydantic
+numpy
+pandas
+matplotlib
+pydub
+audioop-lts; python_version >= "3.13"
+noisereduce
+rapidfuzz
+weasyprint
