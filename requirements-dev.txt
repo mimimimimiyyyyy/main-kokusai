@@ -14,3 +14,4 @@ audioop-lts; python_version >= "3.13"
 noisereduce
 rapidfuzz
 weasyprint
+anthropic

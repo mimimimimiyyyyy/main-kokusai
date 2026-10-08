@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from conftest import SEED_CSV, FakeWhisperModel
+from conftest import SEED_CSV, FakeLLM, FakeWhisperModel
 
 
 @pytest.fixture
@@ -16,7 +16,7 @@ def app_ctx(skill, conn, tmp_path):
     app = FastAPI()
     model = FakeWhisperModel()
     ctx = skill.register_skill_transfer(
-        app, conn=conn, whisper_model=model, media_dir=str(tmp_path / "media"),
+        app, conn=conn, whisper_model=model, llm_fn=FakeLLM(), media_dir=str(tmp_path / "media"),
         seed_csv=str(SEED_CSV), run_in_background=False,
     )
     return app, ctx, model
@@ -144,6 +144,7 @@ def test_anonymize_uses_mask_function_only_when_enabled(skill, conn, tmp_path, s
 
     app = FastAPI()
     ctx = skill.register_skill_transfer(app, conn=conn, whisper_model=FakeWhisperModel(), mask_fn=mask_fn,
+                                        llm_fn=FakeLLM(),
                                         media_dir=str(tmp_path / "m"), seed_csv=str(SEED_CSV),
                                         run_in_background=False)
     client = TestClient(app)

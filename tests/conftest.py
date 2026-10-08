@@ -226,3 +226,39 @@ def default_whisper_segments():
         whisper_segment(0.0, 2.0, [("まず", 0.0, 0.4), ("型枠を", 0.4, 1.0), ("立てます。", 1.0, 2.0)]),
         whisper_segment(2.0, 3.0, [("次は", 2.0, 2.4), ("セパを", 2.4, 2.7), ("入れます。", 2.7, 3.0)]),
     ]
+
+
+DEFAULT_PROCEDURE = {
+    "steps": [
+        {"title": "型枠を立てる", "description": "墨に合わせて型枠を立てる。", "start_segment": 0, "end_segment": 0,
+         "tools": ["インパクトドライバー"], "materials": ["コンパネ"], "cautions": ["倒れないように仮止めする"],
+         "tips": ["下から順に締めるのがコツ"]},
+        {"title": "セパを入れる", "description": "セパレーターを入れて間隔を保つ。", "start_segment": 1, "end_segment": 1,
+         "tools": [], "materials": ["セパ"], "cautions": [], "tips": []},
+    ]
+}
+
+
+class FakeLLM:
+    """
+    LLM（OpenAI / Claude）の代わり。プロンプト先頭の「# task: 〜」で用途を見分け、
+    用意した応答を順番に返す。応答は dict（JSONにして返す）か文字列（そのまま返す）。
+    """
+
+    def __init__(self, **responses):
+        self.responses = {"procedure": [DEFAULT_PROCEDURE], **responses}
+        self.prompts = []
+        self.method_version = "fake:llm"
+
+    def __call__(self, prompt):
+        import json
+        self.prompts.append(prompt)
+        task = prompt.split("\n", 1)[0].replace("# task:", "").strip()
+        queue = self.responses[task]
+        response = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(response, Exception):
+            raise response
+        return response if isinstance(response, str) else json.dumps(response, ensure_ascii=False)
+
+    def prompts_for(self, task):
+        return [p for p in self.prompts if p.startswith(f"# task: {task}")]

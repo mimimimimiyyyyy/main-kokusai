@@ -13,7 +13,7 @@
 # 対話研究のデータ（sessions / turns など）とは混ぜず、同じcorpus.dbの中に
 # skill_ で始まる表を別に作って保存する（docs/skill-transfer-mapping.md のQ1）。
 
-!pip install fastapi uvicorn python-multipart pydub noisereduce rapidfuzz weasyprint -q
+!pip install fastapi uvicorn python-multipart pydub noisereduce rapidfuzz weasyprint openai anthropic -q
 !apt-get -qq install -y fonts-noto-cjk > /dev/null
 
 import os, re, csv, json, shutil, sqlite3, inspect, threading, traceback, subprocess
@@ -608,8 +608,6 @@ def step_transcribe(ctx, video_id):
     update_skill_video(ctx.conn, video_id, vtt_path=vtt_path)
 
 
-SKILL_STEPS = [("media", step_media), ("transcribe", step_transcribe)]
-SKILL_STEP_NAMES = [name for name, _ in SKILL_STEPS]
 
 
 def run_skill_pipeline(ctx, video_id, start_step=None):
@@ -644,7 +642,325 @@ def start_skill_pipeline(ctx, video_id, start_step=None):
         run_skill_pipeline(ctx, video_id, start_step)
 
 
-# --- 7. API（/skill/api/...） ---
+# --- 7. LLMの呼び出し（1か所にまとめる） ---
+# 既定は既存セルと同じOpenAI（gpt-4o・JSONモード）。SKILL_LLM_PROVIDER=anthropic で
+# Claudeに切り替えられる。どちらも「プロンプトを渡してJSONの文字列を受け取る」関数
+# （llm_fn）として扱い、手順書・タグ付けはこの関数だけを使う。テストではこの関数を
+# モックに差し替える。
+SKILL_LLM_DEFAULT_MODELS = {"openai": "gpt-4o", "anthropic": "claude-opus-5-5"}
+
+
+def make_llm_fn(provider=None, model=None, openai_client=None):
+    provider = provider or SKILL_LLM_PROVIDER
+    if provider not in SKILL_LLM_DEFAULT_MODELS:
+        raise ValueError(f"SKILL_LLM_PROVIDER は openai か anthropic を指定してください: {provider}")
+    model = model or SKILL_LLM_MODEL or SKILL_LLM_DEFAULT_MODELS[provider]
+    clients = {}
+
+    def call_openai(prompt):
+        if "openai" not in clients:
+            import openai
+            clients["openai"] = openai_client or openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        res = clients["openai"].chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return res.choices[0].message.content
+
+    def call_anthropic(prompt):
+        if "anthropic" not in clients:
+            import anthropic
+            clients["anthropic"] = anthropic.Anthropic()
+        options = {}
+        if model == "claude-opus-5-5":
+            # 安全判定で断られた場合に、同じリクエストを別のモデルで続けるサーバー側の仕組み
+            options = {"betas": ["server-side-fallback-2026-06-01"], "fallbacks": [{"model": "claude-opus-4-8"}]}
+        res = clients["anthropic"].beta.messages.create(
+            model=model, max_tokens=16000,
+            messages=[{"role": "user", "content": prompt}],
+            **options
+        )
+        if res.stop_reason == "refusal":
+            raise RuntimeError("LLMが応答を断りました")
+        return "".join(b.text for b in res.content if b.type == "text")
+
+    call = call_openai if provider == "openai" else call_anthropic
+    call.method_version = f"{provider}:{model}"
+    return call
+
+
+def parse_json_text(text):
+    """LLMの出力からJSONを取り出す（```json で囲まれていても読めるようにする）。"""
+    text = (text or "").strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if m:
+        text = m.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("JSONが見つかりません")
+    return json.loads(text[start:end + 1])
+
+
+def call_llm_json(llm_fn, prompt, validate):
+    """
+    LLMに固定スキーマのJSONを出させ、validate(dict) で検証する。検証に失敗したら、
+    理由を添えて1回だけ再試行する（2回とも失敗したらエラーにして状態に残す）。
+    戻り値: (検証済みの結果, LLMの生の出力)
+    """
+    errors = []
+    current = prompt
+    for attempt in range(2):
+        raw = llm_fn(current)
+        try:
+            return validate(parse_json_text(raw)), raw
+        except Exception as e:
+            errors.append(f"{type(e).__name__}: {e}")
+            current = (prompt + "\n\n# 前回の出力は次の理由で不正でした。指定どおりのJSONだけを返してください。\n"
+                       + errors[-1][:1000])
+    raise ValueError("LLMの出力が2回とも指定の形式になりませんでした: " + " / ".join(e[:300] for e in errors))
+
+
+def save_llm_result(conn, video_id, kind, method_version, result):
+    conn.execute(
+        "INSERT INTO skill_llm_results (video_id, kind, method_version, created, result) VALUES (?,?,?,?,?)",
+        (video_id, kind, method_version, now_str(), json.dumps(result, ensure_ascii=False))
+    )
+    conn.commit()
+
+
+# --- 8. ② 手順書 ---
+from pydantic import BaseModel, field_validator
+
+
+class ProcedureStep(BaseModel):
+    title: str
+    description: str
+    start_segment: int
+    end_segment: int
+    tools: list[str] = []
+    materials: list[str] = []
+    cautions: list[str] = []
+    tips: list[str] = []
+
+    @field_validator("title", "description")
+    @classmethod
+    def not_blank(cls, v):
+        if not v.strip():
+            raise ValueError("空欄です")
+        return v.strip()
+
+
+class ProcedureResult(BaseModel):
+    steps: list[ProcedureStep]
+
+
+def validate_procedure(data, n_segments):
+    """スキーマに加えて、セグメント番号が範囲内・順番どおり・重ならないことを確かめる。"""
+    result = ProcedureResult.model_validate(data)
+    if not result.steps:
+        raise ValueError("手順が1つもありません")
+    prev_end = -1
+    for i, step in enumerate(result.steps):
+        if not (0 <= step.start_segment <= step.end_segment < n_segments):
+            raise ValueError(f"手順{i + 1}のセグメント番号が範囲外です（0〜{n_segments - 1}）")
+        if step.start_segment <= prev_end:
+            raise ValueError(f"手順{i + 1}が前の手順と重なっているか、順番が逆です")
+        prev_end = step.end_segment
+    return result
+
+
+def build_procedure_prompt(title, segments):
+    lines = "\n".join(
+        f"[{i}] ({s['start']:.1f}〜{s['end']:.1f}秒) {s['text']}" for i, s in enumerate(segments)
+    )
+    return f"""# task: procedure
+あなたは建設現場の技能伝承を手伝う専門家です。熟練者が作業しながら説明した動画の
+文字起こし（番号付きの文）から、若手向けの手順書を作ります。
+
+ルール:
+- 「まず」「最初に」「次に」「次は」「それから」「続いて」「最後に」などの区切りの言葉を手がかりに、作業の手順に分ける
+- 各手順は、連続した文の範囲（start_segment〜end_segment、番号は下の[ ]の数字）で表す。手順同士は重ねず、順番どおりに並べる
+- 作業に関係ない雑談やあいさつの文は、どの手順にも含めなくてよい
+- title: 手順の短い見出し（例: 型枠を建て込む）
+- description: その手順で何をするかを、若手が読んで分かるように1〜3文で
+- tools: 使う道具 / materials: 使う資材 / cautions: 注意点・危険 / tips: コツ・勘所（「〜するのがコツ」「感覚としては〜」など、熟練者ならではの説明）
+- 文字起こしに出てこないことは書かない。該当がなければ空の配列にする
+- 文字起こしには音声認識の誤りが含まれることがある。文脈から明らかな誤りは正しい用語で書いてよい
+
+動画のタイトル: {title}
+
+文字起こし:
+{lines}
+
+次の形のJSONだけを返してください:
+{{"steps": [{{"title": "...", "description": "...", "start_segment": 0, "end_segment": 3,
+  "tools": ["..."], "materials": ["..."], "cautions": ["..."], "tips": ["..."]}}]}}
+"""
+
+
+def generate_procedure(llm_fn, title, segments):
+    """② の1〜2: 手順に分け、手順ごとの道具・資材・注意点・コツを取り出す。"""
+    prompt = build_procedure_prompt(title, segments)
+    result, raw = call_llm_json(llm_fn, prompt, lambda d: validate_procedure(d, len(segments)))
+    steps = []
+    for step in result.steps:
+        covered = segments[step.start_segment:step.end_segment + 1]
+        steps.append({
+            # 開始・終了時間はLLMに決めさせず、元の文字起こしの時間から決める
+            "start": covered[0]["start"], "end": covered[-1]["end"],
+            "title": step.title, "description": step.description,
+            "tools": step.tools, "materials": step.materials,
+            "cautions": step.cautions, "tips": step.tips,
+            "segment_ids": [s["segment_id"] for s in covered],
+        })
+    return steps, raw
+
+
+def save_steps(conn, video_id, steps, method_version):
+    """手順を区間アノテーション（layer='step'）として保存する。手順に付く場面タグ・動画タグも作り直すため消す。"""
+    conn.execute(
+        "DELETE FROM skill_annotations WHERE video_id=? AND layer IN ('step', 'scene_tag', 'video_tag')",
+        (video_id,)
+    )
+    now = now_str()
+    for i, step in enumerate(steps):
+        payload = {k: step[k] for k in ("description", "tools", "materials", "cautions", "tips", "segment_ids")}
+        payload["index"] = i
+        payload["photo"] = step.get("photo")
+        conn.execute(
+            """INSERT INTO skill_annotations
+               (video_id, layer, start, end, label, payload, source, method_version, created)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (video_id, "step", step["start"], step["end"], step["title"],
+             json.dumps(payload, ensure_ascii=False), "llm", method_version, now)
+        )
+    conn.commit()
+
+
+def get_steps(conn, video_id):
+    rows = conn.execute(
+        """SELECT id, start, end, label, payload FROM skill_annotations
+           WHERE video_id=? AND layer='step' ORDER BY start, id""",
+        (video_id,)
+    ).fetchall()
+    steps = []
+    for annotation_id, start, end, label, payload in rows:
+        data = json.loads(payload or "{}")
+        steps.append({"step_id": annotation_id, "start": start, "end": end, "title": label, **data})
+    return steps
+
+
+def format_clock(seconds):
+    seconds = int(seconds or 0)
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+PROCEDURE_CSS = """
+@page { size: A4; margin: 16mm 14mm; @bottom-center { content: counter(page) " / " counter(pages); font-size: 9pt; color: #666; } }
+body { font-family: "Noto Sans CJK JP", "Noto Sans JP", "IPAexGothic", sans-serif; font-size: 10.5pt; color: #222; line-height: 1.55; }
+h1 { font-size: 18pt; margin: 0 0 4px; border-bottom: 3px solid #e67e00; padding-bottom: 4px; }
+.meta { color: #555; font-size: 9.5pt; margin-bottom: 12px; }
+.summary { border: 1px solid #ccc; padding: 6px 10px; margin-bottom: 12px; font-size: 9.5pt; }
+.step { border: 1px solid #bbb; border-radius: 4px; margin-bottom: 10px; page-break-inside: avoid; }
+.step-head { background: #fff3e0; padding: 5px 10px; font-weight: bold; font-size: 12pt; }
+.step-head .time { float: right; font-weight: normal; font-size: 9.5pt; color: #555; }
+.step-body { display: flex; gap: 10px; padding: 8px 10px; }
+.photo { width: 62mm; flex: none; }
+.photo img { width: 100%; border: 1px solid #ccc; }
+.text { flex: 1; }
+.label { display: inline-block; font-weight: bold; min-width: 4.5em; }
+.caution { color: #b00020; }
+.tip { color: #0b5394; }
+ul { margin: 2px 0 4px 1.2em; padding: 0; }
+"""
+
+
+def render_procedure_html(video, steps):
+    """② の3: 決まった書式（HTML）に当てはめる。PDFはこのHTMLから作る。"""
+    from html import escape
+
+    def items(values, css=""):
+        if not values:
+            return "<span>－</span>"
+        return "<ul>" + "".join(f'<li class="{css}">{escape(v)}</li>' for v in values) + "</ul>"
+
+    all_tools = sorted({t for s in steps for t in s.get("tools", [])})
+    all_materials = sorted({m for s in steps for m in s.get("materials", [])})
+    blocks = []
+    for i, step in enumerate(steps, start=1):
+        photo = step.get("photo")
+        photo_html = (f'<div class="photo"><img src="file://{escape(photo)}"></div>'
+                      if photo and os.path.exists(photo) else "")
+        blocks.append(f"""
+<div class="step">
+  <div class="step-head">手順{i}　{escape(step['title'])}<span class="time">動画 {format_clock(step['start'])}〜{format_clock(step['end'])}</span></div>
+  <div class="step-body">{photo_html}
+    <div class="text">
+      <p>{escape(step.get('description', ''))}</p>
+      <div><span class="label">道具</span>{items(step.get('tools'))}</div>
+      <div><span class="label">資材</span>{items(step.get('materials'))}</div>
+      <div><span class="label caution">注意点</span>{items(step.get('cautions'), 'caution')}</div>
+      <div><span class="label tip">コツ</span>{items(step.get('tips'), 'tip')}</div>
+    </div>
+  </div>
+</div>""")
+    explainer = f"説明者: {escape(video['explainer'])}　" if video.get("explainer") else ""
+    return f"""<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8"><style>{PROCEDURE_CSS}</style></head>
+<body>
+<h1>{escape(video['title'])}</h1>
+<div class="meta">{explainer}動画の長さ: {format_clock(video.get('duration'))}　作成日: {escape((video.get('created') or '')[:10])}　手順数: {len(steps)}</div>
+<div class="summary"><span class="label">道具</span>{escape('、'.join(all_tools) or '－')}<br>
+<span class="label">資材</span>{escape('、'.join(all_materials) or '－')}</div>
+{''.join(blocks)}
+<p class="meta">この手順書は、動画の説明音声からAIが自動で作成しました。内容は動画と合わせて確認してください。</p>
+</body></html>"""
+
+
+def write_procedure_pdf(html_text, pdf_path):
+    from weasyprint import HTML
+    HTML(string=html_text, base_url="/").write_pdf(pdf_path)
+    return pdf_path
+
+
+def add_step_photos(video_path, steps, folder):
+    """各手順の時間帯の中ほどの1コマを、手順書の写真として切り出す（失敗しても手順書は作る）。"""
+    os.makedirs(folder, exist_ok=True)
+    for i, step in enumerate(steps, start=1):
+        try:
+            step["photo"] = extract_frame(video_path, (step["start"] + step["end"]) / 2,
+                                          os.path.join(folder, f"step_{i}.jpg"))
+        except RuntimeError:
+            traceback.print_exc()
+            step["photo"] = None
+    return steps
+
+
+def step_procedure(ctx, video_id):
+    """② 手順書作成（手順分割 → 道具・資材・注意点・コツの抽出 → 写真 → PDF）。"""
+    if ctx.llm_fn is None:
+        raise RuntimeError("LLMが設定されていません")
+    video = get_skill_video(ctx.conn, video_id)
+    segments = get_segments(ctx.conn, video_id)
+    if not segments:
+        raise RuntimeError("文字起こしがありません")
+    method_version = f"{getattr(ctx.llm_fn, 'method_version', 'llm')}@{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    steps, raw = generate_procedure(ctx.llm_fn, video["title"], segments)
+    save_llm_result(ctx.conn, video_id, "procedure", method_version, {"raw": raw, "steps": steps})
+    folder = video_dir(video_id, ctx.media_dir)
+    add_step_photos(video["media_path"], steps, os.path.join(folder, "steps"))
+    save_steps(ctx.conn, video_id, steps, method_version)
+    pdf_path = write_procedure_pdf(render_procedure_html(video, get_steps(ctx.conn, video_id)),
+                                   os.path.join(folder, "procedure.pdf"))
+    update_skill_video(ctx.conn, video_id, pdf_path=pdf_path)
+
+
+SKILL_STEPS = [("media", step_media), ("transcribe", step_transcribe), ("procedure", step_procedure)]
+SKILL_STEP_NAMES = [name for name, _ in SKILL_STEPS]
+
+
+# --- 9. API（/skill/api/...） ---
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, Response
 
@@ -659,6 +975,14 @@ def video_summary(video):
     summary["has_media"] = bool(video["media_path"])
     summary["has_pdf"] = bool(video["pdf_path"])
     return summary
+
+
+def public_step(video_id, step):
+    """画面に返す手順（写真はDrive上のパスでなく、取得用のURLにする）。"""
+    step = dict(step)
+    number = step.get("index", 0) + 1
+    step["photo_url"] = f"/skill/api/videos/{video_id}/steps/{number}.jpg" if step.pop("photo", None) else None
+    return step
 
 
 def create_skill_router(ctx):
@@ -690,7 +1014,8 @@ def create_skill_router(ctx):
     @router.get("/skill/api/videos/{video_id}")
     def api_skill_video(video_id: int):
         video = require_video(video_id)
-        return {**video_summary(video), "segments": get_segments(ctx.conn, video_id)}
+        return {**video_summary(video), "segments": get_segments(ctx.conn, video_id),
+                "steps": [public_step(video_id, s) for s in get_steps(ctx.conn, video_id)]}
 
     @router.post("/skill/api/videos/{video_id}/retry")
     def api_skill_retry(video_id: int):
@@ -718,6 +1043,23 @@ def create_skill_router(ctx):
             raise HTTPException(status_code=404, detail="サムネイルがありません")
         return FileResponse(path, media_type="image/jpeg")
 
+    @router.get("/skill/api/videos/{video_id}/procedure.pdf")
+    def api_skill_procedure_pdf(video_id: int):
+        video = require_video(video_id)
+        if not video["pdf_path"] or not os.path.exists(video["pdf_path"]):
+            raise HTTPException(status_code=404, detail="手順書はまだできていません")
+        return FileResponse(video["pdf_path"], media_type="application/pdf",
+                            filename=f"手順書_{video['title']}.pdf")
+
+    @router.get("/skill/api/videos/{video_id}/steps/{step_number}.jpg")
+    def api_skill_step_photo(video_id: int, step_number: int):
+        require_video(video_id)
+        steps = get_steps(ctx.conn, video_id)
+        if not 1 <= step_number <= len(steps) or not steps[step_number - 1].get("photo") \
+                or not os.path.exists(steps[step_number - 1]["photo"]):
+            raise HTTPException(status_code=404, detail="写真がありません")
+        return FileResponse(steps[step_number - 1]["photo"], media_type="image/jpeg")
+
     @router.get("/skill/api/videos/{video_id}/subtitles.vtt")
     def api_skill_subtitles(video_id: int):
         require_video(video_id)
@@ -742,6 +1084,8 @@ def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=No
     os.makedirs(media_dir, exist_ok=True)
     if conn.execute("SELECT COUNT(*) FROM skill_tags").fetchone()[0] == 0 and os.path.exists(seed_csv):
         print("技能伝承: タグ一覧の初期データを投入しました", seed_skill_tags(conn, seed_csv))
+    if llm_fn is None:
+        llm_fn = make_llm_fn(openai_client=openai_client)
     ctx = SkillContext(conn, media_dir=media_dir, whisper_model=whisper_model, llm_fn=llm_fn,
                        mask_fn=mask_fn, run_in_background=run_in_background)
     ctx.openai_client = openai_client
@@ -750,7 +1094,7 @@ def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=No
     return ctx
 
 
-# --- 8. 既存セルのサーバー起動時に自動で登録する仕組み ---
+# --- 10. 既存セルのサーバー起動時に自動で登録する仕組み ---
 def install_skill_transfer_hook(namespace=None):
     """
     uvicorn.Server.serve を包み、サーバー起動の直前に register_skill_transfer を呼ぶ。
