@@ -43,7 +43,6 @@ def test_prompt_contains_numbered_segments_and_separator_words(skill):
 
 @pytest.mark.parametrize("bad", [
     "これはJSONではありません",
-    {"steps": []},
     {"steps": [step(start=0, end=5)]},                      # 範囲外
     {"steps": [step(start=2, end=1)]},                      # 開始 > 終了
     {"steps": [step(start=0, end=1), step(start=1, end=2)]},  # 重なり
@@ -61,10 +60,26 @@ def test_invalid_output_is_retried_once_then_succeeds(skill, bad):
 
 
 def test_two_invalid_outputs_raise(skill):
-    llm = FakeLLM(procedure=["だめ", {"steps": []}])
+    llm = FakeLLM(procedure=["だめ", {"steps": [step(start=0, end=9)]}])
     with pytest.raises(ValueError, match="2回とも"):
         skill.generate_procedure(llm, "型枠", SEGMENTS)
     assert len(llm.prompts) == 2
+
+
+def test_no_steps_from_llm_becomes_one_step_for_whole_video(skill):
+    """説明が短いなどで LLM が手順に分けられなかったときは、止めずに動画全体を1つの手順にする。"""
+    llm = FakeLLM(procedure=[{"steps": []}])
+    steps, _ = skill.generate_procedure(llm, "型枠の建て込み", SEGMENTS)
+    assert len(llm.prompts) == 1
+    assert [(s["title"], s["start"], s["end"]) for s in steps] == [("型枠の建て込み", 0.0, 6.0)]
+    assert steps[0]["segment_ids"] == [11, 12, 13]
+    assert "手順を区切れなかった" in steps[0]["description"]
+
+
+def test_prompt_asks_for_at_least_one_step(skill):
+    llm = FakeLLM()
+    skill.generate_procedure(llm, "型枠", SEGMENTS)
+    assert "手順は必ず1つ以上返す" in llm.prompts[0]
 
 
 def test_json_inside_code_fence_is_accepted(skill):

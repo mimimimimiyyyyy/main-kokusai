@@ -831,10 +831,12 @@ class ProcedureResult(BaseModel):
 
 
 def validate_procedure(data, n_segments):
-    """スキーマに加えて、セグメント番号が範囲内・順番どおり・重ならないことを確かめる。"""
+    """
+    スキーマに加えて、セグメント番号が範囲内・順番どおり・重ならないことを確かめる。
+    手順が0個でも不正にはしない（説明が短い動画などで、LLMが手順に分けられないことがある。
+    その場合は generate_procedure で動画全体を1つの手順にする）。
+    """
     result = ProcedureResult.model_validate(data)
-    if not result.steps:
-        raise ValueError("手順が1つもありません")
     prev_end = -1
     for i, step in enumerate(result.steps):
         if not (0 <= step.start_segment <= step.end_segment < n_segments):
@@ -857,6 +859,7 @@ def build_procedure_prompt(title, segments):
 - 「まず」「最初に」「次に」「次は」「それから」「続いて」「最後に」などの区切りの言葉を手がかりに、作業の手順に分ける
 - 各手順は、連続した文の範囲（start_segment〜end_segment、番号は下の[ ]の数字）で表す。手順同士は重ねず、順番どおりに並べる
 - 作業に関係ない雑談やあいさつの文は、どの手順にも含めなくてよい
+- 手順は必ず1つ以上返す。区切りの言葉が無くても、内容のまとまりごとに分ける。説明が短い場合は、全体を1つの手順にまとめてよい
 - title: 手順の短い見出し（例: 型枠を建て込む）
 - description: その手順で何をするかを、若手が読んで分かるように1〜3文で
 - tools: 使う道具 / materials: 使う資材 / cautions: 注意点・危険 / tips: コツ・勘所（「〜するのがコツ」「感覚としては〜」など、熟練者ならではの説明）
@@ -878,6 +881,11 @@ def generate_procedure(llm_fn, title, segments):
     """② の1〜2: 手順に分け、手順ごとの道具・資材・注意点・コツを取り出す。"""
     prompt = build_procedure_prompt(title, segments)
     result, raw = call_llm_json(llm_fn, prompt, lambda d: validate_procedure(d, len(segments)))
+    if not result.steps:
+        # LLMが手順に分けられなかったときは、エラーで止めずに動画全体を1つの手順にする
+        result.steps = [ProcedureStep(
+            title=title, start_segment=0, end_segment=len(segments) - 1,
+            description="説明の文字起こしから手順を区切れなかったため、動画全体を1つの手順にしています。")]
     steps = []
     for step in result.steps:
         covered = segments[step.start_segment:step.end_segment + 1]
