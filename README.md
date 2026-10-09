@@ -69,12 +69,16 @@ Google Colab のセルとして動かし、ngrok で公開した API を画面�
 
 ### 動作確認用のサンプル動画
 
-`samples/make_sample_video.py` で、熟練者が「壁の型枠の建て込み」を説明している想定の動画（約80秒、縦長、合成音声）を作れる。
-騒音なし（`sample_katawaku_clean.mp4`）と、重機・電動工具の音を混ぜたもの（`sample_katawaku_noisy.mp4`）の2本ができる。
+`samples/make_sample_video.py` で、「壁の型枠の建て込み」の動画（縦長、合成音声＋説明スライド）を作れる。
+
+- `katawaku`：熟練者が1人で説明する（約80秒）
+- `dialogue`：上司が後輩に教えている会話（約100秒。声の高さと速さを変えて2人を区別）
+
+それぞれ騒音なし（`*_clean.mp4`）と、重機・電動工具の音を混ぜたもの（`*_noisy.mp4`）ができる。
 
 ```bash
 pip install pyopenjtalk-plus pillow numpy
-python samples/make_sample_video.py samples
+python samples/make_sample_video.py samples all   # katawaku / dialogue / all
 ```
 
 ### 自動処理の流れ
