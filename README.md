@@ -67,6 +67,16 @@ Google Colab のセルとして動かし、ngrok で公開した API を画面�
 | 撮影・投稿 | 「撮影する」でカメラが開く。「ファイル選択」で撮影済みの動画も選べる。タイトルを入れて投稿すると処理状況が表示される。失敗したら「失敗したところから再実行」 |
 | タグ管理（PC 向け、ホームの下のリンク） | タグの追加・編集・削除、別名の登録、新タグ候補（タグ一覧に無かった言葉）の採用・却下、「全動画のタグを付け直す」 |
 
+### 動作確認用のサンプル動画
+
+`samples/make_sample_video.py` で、熟練者が「壁の型枠の建て込み」を説明している想定の動画（約80秒、縦長、合成音声）を作れる。
+騒音なし（`sample_katawaku_clean.mp4`）と、重機・電動工具の音を混ぜたもの（`sample_katawaku_noisy.mp4`）の2本ができる。
+
+```bash
+pip install pyopenjtalk-plus pillow numpy
+python samples/make_sample_video.py samples
+```
+
 ### 自動処理の流れ
 
 投稿すると、次の 4 段階を順に行う。状態・失敗した段階・エラー内容は `skill_videos` 表に残り、失敗した段階からやり直せる。
