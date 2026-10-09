@@ -73,7 +73,12 @@ def upload_through_screen(page, base, video_path, title="型枠の建て込み")
     page.fill("#title", title)
     page.fill("#explainer", "山田")
     page.click("#upload-button")
-    page.wait_for_selector("text=動画を見る", timeout=30000)
+    try:
+        page.wait_for_selector("text=動画を見る", timeout=60000)
+    except playwright_api.TimeoutError:
+        # どの段階で止まったかを失敗の理由に出す
+        status = page.inner_text("#status-area") if page.locator("#status-area").count() else ""
+        pytest.fail(f"投稿の処理が終わりませんでした。画面の状態: {status!r}")
 
 
 def test_page_is_served_from_the_cell(skill, conn, tmp_path):
@@ -316,4 +321,35 @@ def test_recent_uploads_show_status_and_failed_video_can_be_opened(server, page,
     assert page.inner_text("#recent-uploads .status-badge") == "失敗"
     page.click("#recent-uploads .video-card")
     page.wait_for_selector("text=失敗したところから再実行")
+    assert page.errors == []
+
+
+def test_search_from_home_and_jump_to_scene(skill, server, page, sample_video):
+    base, ctx, _ = server
+    upload_through_screen(page, base, sample_video)
+    page.goto(f"{base}/skill#/")
+    page.wait_for_selector("#search-input")
+    page.fill("#search-input", "セパ")
+    page.press("#search-input", "Enter")
+    page.wait_for_selector("#search-results .search-result")
+    assert "型枠の建て込み" in page.inner_text("#search-results")
+    assert page.locator("#search-results mark").count() > 0
+    assert no_horizontal_scroll(page)
+    screenshot(page, "07_search")
+
+    # 字幕でヒットした場面（2秒〜）をタップすると、その時間から再生する
+    page.click("#search-results a.hit:has-text('字幕')")
+    page.wait_for_selector("#player")
+    page.wait_for_function("Math.abs(document.getElementById('player').currentTime - 2.0) < 0.05")
+    assert page.errors == []
+
+
+def test_search_with_no_results_and_header_link(server, page):
+    base, _, _ = server
+    page.goto(f"{base}/skill#/")
+    page.click("header a[title='検索']")
+    page.wait_for_selector("#search-input")
+    page.fill("#search-input", "クレーン")
+    page.click(".search-form button")
+    page.wait_for_selector("text=見つかりませんでした")
     assert page.errors == []

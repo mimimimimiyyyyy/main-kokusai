@@ -1315,6 +1315,76 @@ def search_videos(conn, work_tag_id=None, tag_ids=(), include_unfinished=False):
     return [dict(zip(VIDEO_COLUMNS, r)) for r in rows]
 
 
+SEARCH_MAX_HITS_PER_VIDEO = 5
+SEARCH_STEP_FIELDS = [("tools", "道具"), ("materials", "資材"), ("cautions", "注意点"), ("tips", "コツ")]
+
+
+def search_key(text):
+    """検索で比べるための形（全角・半角、大文字・小文字、空白の違いをそろえる）。"""
+    return re.sub(r"\s", "", unicodedata.normalize("NFKC", text or "").lower())
+
+
+def expand_search_term(term, tags):
+    """
+    検索語と、それに当たるタグの名前・別名（現場や人による呼び方の違いを吸収する）。
+    例: 「インパクト」→ インパクト、インパクトドライバー、インパクトドライバ
+    """
+    words = [term]
+    m = match_tag(term, tags)
+    if m:
+        words += [m["tag"]["name"]] + m["tag"]["aliases"]
+    seen, result = set(), []
+    for w in words:
+        if search_key(w) and search_key(w) not in seen:
+            seen.add(search_key(w))
+            result.append(w)
+    return result
+
+
+def video_search_fields(conn, video):
+    """1本の動画の中で検索する所: (種類, 見出し, 文字, 再生を始める時間)。"""
+    fields = [("タイトル", "タイトル", video["title"], None)]
+    fields += [("タグ", "タグ", t["name"], None) for t in get_video_tags(conn, video["id"])]
+    for step in get_steps(conn, video["id"]):
+        n = step.get("index", 0) + 1
+        fields.append(("手順", f"手順{n}", step["title"], step["start"]))
+        if step.get("description"):
+            fields.append(("手順", f"手順{n}の説明", step["description"], step["start"]))
+        for key, label in SEARCH_STEP_FIELDS:
+            fields += [("手順", f"手順{n}の{label}", v, step["start"]) for v in step.get(key, [])]
+    fields += [("字幕", "字幕", seg["text"], seg["start"]) for seg in get_segments(conn, video["id"])]
+    return fields
+
+
+def search_skill_videos(conn, query, max_hits=SEARCH_MAX_HITS_PER_VIDEO):
+    """
+    キーワード検索。タイトル・タグ・手順書（手順名・説明・道具・資材・注意点・コツ）・字幕から探す。
+    空白で区切った言葉は、すべてを含む動画だけを返す（AND）。各言葉はタグの別名でも探す。
+    ヒットした所は、再生を始める時間とともに返す（タップでその場面から見られるように）。
+    """
+    terms = [t for t in re.split(r"[\s\u3000]+", query.strip()) if t]
+    tags = list_skill_tags(conn)
+    expanded = [expand_search_term(t, tags) for t in terms]
+    keys_per_term = [[search_key(w) for w in words] for words in expanded]
+    results = []
+    for video in search_videos(conn):
+        fields = video_search_fields(conn, video)
+        field_keys = [search_key(f[2]) for f in fields]
+        if not all(any(k in fk for k in keys for fk in field_keys) for keys in keys_per_term):
+            continue
+        hits = [
+            {"kind": kind, "label": label, "text": text, "start": start}
+            for (kind, label, text, start), fk in zip(fields, field_keys)
+            if any(k in fk for keys in keys_per_term for k in keys)
+        ]
+        # タイトル・タグを先に、そのあと動画の中の場面を時間順に並べる
+        hits.sort(key=lambda h: (h["start"] is not None, h["start"] or 0))
+        results.append({**video_summary(video), "video_tags": get_video_tags(conn, video["id"]),
+                        "hit_count": len(hits), "hits": hits[:max_hits]})
+    results.sort(key=lambda r: -r["hit_count"])  # 同じ数なら新しい順のまま
+    return {"terms": terms, "words": [w for words in expanded for w in words], "videos": results}
+
+
 class TagBody(BaseModel):
     name: str
     category: str
@@ -1533,6 +1603,16 @@ def create_skill_router(ctx):
         facets = sorted(facet_counts.values(), key=lambda t: (TAG_CATEGORIES.index(t["category"])
                                                               if t["category"] in TAG_CATEGORIES else 99, -t["count"], t["name"]))
         return {"videos": result, "facets": facets}
+
+    @router.get("/skill/api/search")
+    def api_skill_search(q: str = ""):
+        if not q.strip():
+            raise HTTPException(status_code=400, detail="検索する言葉を入力してください")
+        data = search_skill_videos(ctx.conn, q)
+        for v in data["videos"]:
+            thumb = os.path.join(video_dir(v["video_id"], ctx.media_dir), "thumbnail.jpg")
+            v["thumbnail_url"] = f"/skill/api/videos/{v['video_id']}/thumbnail.jpg" if os.path.exists(thumb) else None
+        return data
 
     @router.get("/skill/api/tags")
     def api_skill_tags():
@@ -1851,11 +1931,22 @@ SKILL_PAGE_HTML = r'''<!DOCTYPE html>
         .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; align-items: end; }
         .inline-form { background: #fff8e1; padding: 8px; border-radius: 6px; margin-top: 6px; }
         .notice { background: #e8f5e9; padding: 8px; border-radius: 6px; margin-bottom: 8px; }
+
+        /* 検索 */
+        .search-form { display: flex; gap: 8px; }
+        .search-form input { flex: 1; min-width: 0; }
+        .search-form button { flex: none; }
+        mark { background: #ffe082; padding: 0 1px; }
+        .hits { list-style: none; padding: 0; margin: 6px 0 0; }
+        .hits li a { display: block; padding: 6px 4px; border-top: 1px dotted var(--line); color: var(--text); text-decoration: none; font-size: 0.92em; }
+        .hits .time { font-family: monospace; color: var(--accent-dark); font-weight: bold; margin-right: 6px; }
+        .hits .kind { font-size: 0.75em; background: #eee; border-radius: 8px; padding: 1px 6px; margin-right: 6px; }
     </style>
 </head>
 <body>
     <header>
         <h1>🦺 技能伝承動画</h1>
+        <a href="#/search" title="検索">🔍</a>
         <a href="#/">ホーム</a>
         <a href="#/upload" class="upload">撮影・投稿</a>
     </header>
@@ -1913,6 +2004,7 @@ SKILL_PAGE_HTML = r'''<!DOCTYPE html>
             if (parts[0] === "upload") return renderUpload();
             if (parts[0] === "video" && parts[1]) return renderVideo(Number(parts[1]), params);
             if (parts[0] === "list") return renderList(params);
+            if (parts[0] === "search") return renderSearch(params);
             if (parts[0] === "tags") return renderTags();
             return renderHome(params);
         }
@@ -1963,6 +2055,7 @@ SKILL_PAGE_HTML = r'''<!DOCTYPE html>
                 ? `<a class="button primary" href="#/list?work=${current.tag_id}">「${esc(current.name)}」の動画をすべて見る</a>`
                 : `<a class="button primary" href="#/list">すべての動画を見る</a>`;
             app.innerHTML = `
+                ${current ? "" : searchSection("")}
                 <div class="section">
                     ${current ? breadcrumb(tags, workId, false) : ""}
                     <h2>${current ? esc(current.name) : "作業の種類を選ぶ"}</h2>
@@ -1976,6 +2069,71 @@ SKILL_PAGE_HTML = r'''<!DOCTYPE html>
                     <a class="button primary" href="#/upload">📹 撮影・投稿する</a>
                     <p class="muted" style="margin-top:12px"><a href="#/tags">タグ一覧の管理（PC向け）</a></p>
                 </div>`}`;
+        }
+
+        // --- 検索（タイトル・タグ・手順書・字幕から。タップでその場面から再生） ---
+        function searchSection(query) {
+            return `
+                <div class="section">
+                    <h2>動画を検索</h2>
+                    <form class="search-form" onsubmit="submitSearch(event)">
+                        <input type="search" id="search-input" placeholder="例: セパ 締め付け / 仮止め" value="${esc(query)}">
+                        <button class="primary" type="submit">検索</button>
+                    </form>
+                    <p class="muted" style="margin:4px 0 0">言葉を空白で区切ると、すべてを含む動画を探します</p>
+                </div>`;
+        }
+
+        function submitSearch(event) {
+            event.preventDefault();
+            const query = document.getElementById("search-input").value.trim();
+            if (query) location.hash = `#/search?q=${encodeURIComponent(query)}`;
+        }
+
+        // 見つかった言葉に印を付ける（文字は先にエスケープしてから印を付ける）
+        function highlight(text, words) {
+            let html = esc(text);
+            const sorted = [...new Set(words)].filter(Boolean).sort((a, b) => b.length - a.length);
+            if (!sorted.length) return html;
+            const pattern = sorted.map(w => esc(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+            return html.replace(new RegExp(`(${pattern})`, "gi"), "<mark>$1</mark>");
+        }
+
+        async function renderSearch(params) {
+            const query = params.get("q") || "";
+            if (!query) {
+                app.innerHTML = searchSection("");
+                document.getElementById("search-input").focus();
+                return;
+            }
+            app.innerHTML = searchSection(query) + `<div class="section muted">検索中...</div>`;
+            let data;
+            try {
+                data = await api(`/skill/api/search?q=${encodeURIComponent(query)}`);
+            } catch (err) {
+                return showError(err);
+            }
+            const cards = data.videos.map(v => {
+                const thumb = v.thumbnail_url ? `<img src="${BASE_URL}${v.thumbnail_url}" alt="" loading="lazy">` : `<div class="noimg"></div>`;
+                const hits = v.hits.map(h => {
+                    const href = h.start === null ? `#/video/${v.video_id}` : `#/video/${v.video_id}?t=${h.start}`;
+                    const time = h.start === null ? "" : `<span class="time">${clock(h.start)}</span>`;
+                    return `<li><a class="hit" href="${href}">${time}<span class="kind">${esc(h.label)}</span>${highlight(h.text, data.words)}</a></li>`;
+                }).join("");
+                const more = v.hit_count > v.hits.length ? `<li class="muted">ほか ${v.hit_count - v.hits.length} か所</li>` : "";
+                return `<div class="search-result">
+                    <a class="video-card" href="#/video/${v.video_id}">${thumb}
+                        <div class="info"><div class="title">${highlight(v.title, data.words)}</div>
+                        <div class="muted">${clock(v.duration)}${v.explainer ? "　" + esc(v.explainer) : ""}　${v.hit_count} か所で見つかりました</div></div></a>
+                    <ul class="hits">${hits}${more}</ul></div>`;
+            }).join("");
+            const also = data.words.filter(w => !data.terms.includes(w));
+            app.innerHTML = searchSection(query) + `
+                <div class="section" id="search-results">
+                    <h2>「${esc(query)}」の検索結果（${data.videos.length}件）</h2>
+                    ${also.length ? `<p class="muted">別の呼び方でも探しました: ${also.map(esc).join("、")}</p>` : ""}
+                    ${cards || '<p class="muted">見つかりませんでした。別の言葉で探すか、言葉を減らしてみてください。</p>'}
+                </div>`;
         }
 
         // --- 動画一覧（上部のタグボタンで絞り込み。複数選ぶと、すべてを持つ動画だけ） ---
