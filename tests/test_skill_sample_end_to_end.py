@@ -3,12 +3,12 @@
 
 - 日本語の音声合成（pyopenjtalk）で熟練者の説明を作り、重機・工具のような騒音を混ぜ、
   iPhoneの動画と同じ HEVC の .mov にする
-- Colabと同じ順（技能伝承セル → 既存セル → 既存セルのサーバー起動）で実際にサーバーを起動し、
-  起動時に技能伝承のAPIが自動で登録されることを確かめる
+- 技能伝承のセルを丸ごと実行し（Colab専用のドライブ・GPU・ngrokだけ差し替え）、セル自身が
+  起動したサーバーに対して操作する
 - スマホの画面幅のブラウザで、投稿 → 自動処理 → 再生（字幕・場面ジャンプ）→ 手順書PDF →
   作業の種類からの一覧 → タグ絞り込み までを操作する
 - 音声の取り出し・騒音除去・動画の変換・PDF作成は本物を使う。音声認識（Whisper）とLLMはモック
-  （モデルの取得・APIの呼び出しはテストで行わない）。LLMは既存セルと同じOpenAIクライアントの形で差し替える
+  （モデルの取得・APIの呼び出しはテストで行わない）。LLMはOpenAIクライアントの形で差し替える
 
 pyopenjtalk / Playwright / libx265 が無い環境ではスキップする。
 """
@@ -22,14 +22,11 @@ import wave
 
 import numpy as np
 import pytest
-import uvicorn
-
-from conftest import SEED_CSV, SKILL_HTML, FakeWhisperModel, load_cells_in_colab_order, whisper_segment
+from conftest import ColabStubs, FakeWhisperModel, run_whole_cell, whisper_segment
 
 pyopenjtalk = pytest.importorskip("pyopenjtalk")
 playwright_api = pytest.importorskip("playwright.sync_api")
-from test_existing_pipeline import EXISTING_ROUTES, insert_dialogue_session, routes  # noqa: E402
-from test_skill_screens import PHONE, free_port, screenshot  # noqa: E402
+from test_skill_screens import PHONE, free_port  # noqa: E402
 
 SCRIPT = [
     "それでは型枠の建て込みを説明します。",
@@ -110,7 +107,7 @@ class ScriptedWhisper(FakeWhisperModel):
 
 
 class FakeOpenAIClient:
-    """既存セルの client（openai.OpenAI）と同じ形。プロンプトの用途に応じた応答を返す。"""
+    """openai.OpenAI と同じ形。プロンプトの用途に応じた応答を返す。"""
 
     PROCEDURE = {"steps": [
         {"title": "コンパネを立てる", "description": "墨に合わせてコンパネを立て、仮止めする。",
@@ -148,32 +145,25 @@ def get_json(base, path):
         return json.loads(res.read())
 
 
-def test_sample_video_end_to_end_in_colab_order(tmp_path):
+def test_sample_video_end_to_end_with_the_cell_alone(tmp_path):
     shots = os.environ.get("SKILL_SCREENSHOT_DIR")
     video_path, times, mixed, noise = make_sample_video(str(tmp_path))
 
-    # --- Colabと同じ順でセルを実行し、既存セルのサーバー起動で技能伝承を登録する ---
-    shared = load_cells_in_colab_order(tmp_path / "corpus.db")
-    session_id = insert_dialogue_session(shared)
-    shared.whisper_model = ScriptedWhisper(times)   # 既存セルが読み込むWhisperモデルの代わり
-    shared.client = FakeOpenAIClient()              # 既存セルの OpenAI クライアントの代わり
-    shared.SKILL_DB_PATH = str(tmp_path / "corpus.db")
-    shared.SKILL_MEDIA_DIR = str(tmp_path / "skill_transfer")
-    shared.SKILL_SEED_CSV = str(SEED_CSV)
-    shared.SKILL_HTML_PATH = str(SKILL_HTML)
-    original_serve = uvicorn.Server.serve
-    shared.install_skill_transfer_hook(namespace=shared.__dict__)
+    # --- 技能伝承のセルを丸ごと実行する（セル自身がサーバーを起動する） ---
+    stubs = ColabStubs(whisper_model=ScriptedWhisper(times), openai_client=FakeOpenAIClient())
     port = free_port()
-    server = uvicorn.Server(uvicorn.Config(shared.app, host="127.0.0.1", port=port, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
+    env = {"SKILL_MEDIA_DIR": str(tmp_path / "skill_transfer"), "SKILL_PORT": str(port), "NGROK_AUTH_TOKEN": "t"}
+    cell = {}
+    thread = threading.Thread(target=run_whole_cell, args=(stubs, env), kwargs={"namespace": cell}, daemon=True)
+    thread.start()
     try:
-        thread.start()
-        while not server.started:
+        deadline = time.monotonic() + 60
+        while not (cell.get("skill_server") and cell["skill_server"].started):
+            assert time.monotonic() < deadline and thread.is_alive(), "セルのサーバーが起動しませんでした"
             time.sleep(0.05)
         base = f"http://127.0.0.1:{port}"
-        assert EXISTING_ROUTES <= routes(shared.app)
-        corpus = get_json(base, "/corpus")
-        assert [s["session_id"] for s in corpus["sessions"]] == [session_id]  # 対話研究のデータはそのまま
+        assert stubs.mounted == ["/content/drive"] and stubs.ngrok_commands == [["ngrok", "http", str(port)]]
+        media_dir = env["SKILL_MEDIA_DIR"]
 
         with playwright_api.sync_playwright() as p:
             browser = p.chromium.launch()
@@ -197,7 +187,7 @@ def test_sample_video_end_to_end_in_colab_order(tmp_path):
             # ① 文字起こし・字幕: 文ごとの時間、日本語指定と用語ヒント、騒音除去
             assert [s["text"] for s in video["segments"]] == SCRIPT
             assert [(s["start"], s["end"]) for s in video["segments"]] == times
-            call = shared.whisper_model.calls[0]
+            call = stubs.whisper_model.calls[0]
             assert call["language"] == "ja" and call["carry_initial_prompt"] is True
             assert "セパレーター" in call["initial_prompt"]
             with wave.open(call["audio"]) as w:
@@ -212,7 +202,7 @@ def test_sample_video_end_to_end_in_colab_order(tmp_path):
             assert all(len(line) <= 20 for line in vtt.split("\n") if line and "-->" not in line and not line.isdigit())
 
             # 再生用にH.264へ変換されている（iPhoneのHEVCのままだと再生できない端末がある）
-            media = os.path.join(shared.SKILL_MEDIA_DIR, "videos", "1", "video.mp4")
+            media = os.path.join(media_dir, "videos", "1", "video.mp4")
             codec = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                                     "stream=codec_name", "-of", "csv=p=0", media], capture_output=True, text=True).stdout
             assert codec.strip() == "h264"
@@ -231,7 +221,7 @@ def test_sample_video_end_to_end_in_colab_order(tmp_path):
             scene = {(t["name"], t["start"]) for t in video["scene_tags"]}
             assert ("セパレーター", times[3][0]) in scene and ("レベル", times[5][0]) in scene
             assert [c["word"] for c in get_json(base, "/skill/api/tag_candidates")["candidates"]] == ["墨", "Pコン"]
-            assert len(shared.client.calls) == 2  # 手順書とタグ抽出の2回だけLLMを呼ぶ
+            assert len(stubs.openai_client.calls) == 2  # 手順書とタグ抽出の2回だけLLMを呼ぶ
 
             # ④ 閲覧: 作業の種類をたどって一覧 → タグで絞り込み → 場面から再生
             page.goto(f"{base}/skill#/")
@@ -253,11 +243,9 @@ def test_sample_video_end_to_end_in_colab_order(tmp_path):
             assert errors == []
             browser.close()
 
-        # 技能伝承の処理の後も、対話研究の一覧は変わらない
-        assert get_json(base, "/corpus") == corpus
+        # データはドライブ上の技能伝承専用のDBに入っている
+        assert os.path.exists(os.path.join(media_dir, "skill_transfer.db"))
     finally:
-        server.should_exit = True
-        thread.join(timeout=5)
-        uvicorn.Server.serve = original_serve
-        if "_skill_transfer_original_serve" in vars(uvicorn.Server):
-            del uvicorn.Server._skill_transfer_original_serve
+        if cell.get("skill_server"):
+            cell["skill_server"].should_exit = True
+        thread.join(timeout=10)

@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from conftest import SEED_CSV, SKILL_HTML, FakeLLM, FakeWhisperModel
+from conftest import SEED_CSV, FakeLLM, FakeWhisperModel
 
 playwright_api = pytest.importorskip("playwright.sync_api")
 
@@ -33,7 +33,7 @@ def server(skill, conn, tmp_path):
     llm = FakeLLM()
     ctx = skill.register_skill_transfer(app, conn=conn, whisper_model=FakeWhisperModel(), llm_fn=llm,
                                         media_dir=str(tmp_path / "media"), seed_csv=str(SEED_CSV),
-                                        html_path=str(SKILL_HTML), run_in_background=True)
+                                        run_in_background=True)
     port = free_port()
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=srv.run, daemon=True)
@@ -76,18 +76,12 @@ def upload_through_screen(page, base, video_path, title="型枠の建て込み")
     page.wait_for_selector("text=動画を見る", timeout=30000)
 
 
-def test_page_is_served_and_missing_html_is_explained(skill, conn, tmp_path):
+def test_page_is_served_from_the_cell(skill, conn, tmp_path):
     app = FastAPI()
-    skill.register_skill_transfer(app, conn=conn, llm_fn=FakeLLM(), media_dir=str(tmp_path),
-                                  seed_csv=str(SEED_CSV), html_path=str(tmp_path / "none.html"))
+    skill.register_skill_transfer(app, conn=conn, llm_fn=FakeLLM(), media_dir=str(tmp_path))
     res = TestClient(app).get("/skill")
-    assert res.status_code == 404 and "skill_transfer.html" in res.text
-
-    app2 = FastAPI()
-    skill.register_skill_transfer(app2, conn=conn, llm_fn=FakeLLM(), media_dir=str(tmp_path),
-                                  seed_csv=str(SEED_CSV), html_path=str(SKILL_HTML))
-    res = TestClient(app2).get("/skill")
-    assert res.status_code == 200 and "技能伝承動画" in res.text
+    assert res.status_code == 200 and res.text == skill.SKILL_PAGE_HTML
+    assert "技能伝承動画" in res.text
 
 
 def test_upload_screen_has_camera_and_file_inputs(server, page):

@@ -155,3 +155,16 @@ def test_anonymize_uses_mask_function_only_when_enabled(skill, conn, tmp_path, s
     video_id = upload(client, sample_video).json()["video_id"]
     texts = [s["text"] for s in client.get(f"/skill/api/videos/{video_id}").json()["segments"]]
     assert texts[1] == "次は[MASK]を入れます。"
+
+
+def test_anonymize_default_uses_llm_to_find_words(skill, conn, tmp_path, sample_video):
+    app = FastAPI()
+    llm = FakeLLM(mask=[{"mask_list": [{"word": "セパ"}]}])
+    ctx = skill.register_skill_transfer(app, conn=conn, whisper_model=FakeWhisperModel(), llm_fn=llm,
+                                        media_dir=str(tmp_path / "m"), run_in_background=False)
+    ctx.anonymize = True
+    client = TestClient(app)
+    video_id = upload(client, sample_video).json()["video_id"]
+    texts = [s["text"] for s in client.get(f"/skill/api/videos/{video_id}").json()["segments"]]
+    assert texts[1] == "次は[MASK]を入れます。"
+    assert "まず型枠を立てます。" in llm.prompts_for("mask")[0]

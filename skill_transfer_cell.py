@@ -1,22 +1,21 @@
-# --- 別セル: 技能伝承動画共有機能 ---
-# 建設業向けに、熟練者の作業説明動画から文字起こし・字幕・手順書・タグを自動で作り、
-# 若手がタグで動画を探して見られるようにする機能。
+# --- 技能伝承動画共有機能（建設業向け）: このセル1つで完結 ---
+# 熟練者の作業説明動画から文字起こし・字幕・手順書・タグを自動で作り、
+# 若手がタグで動画を探して見られるようにする。
 #
-# 実行順: このセル → audio_analysis_pipeline.py のセル（いつもどおり）
-# 既存セルは最後にサーバーを起動したまま止まる（await server.serve()）ため、後から
-# 別セルでAPIを追加できない。また既存セルは編集しない方針なので、このセルでは
-# uvicornのサーバー起動処理に「起動直前に技能伝承のAPIをappへ登録する」処理を
-# 差し込んでおく（install_skill_transfer_hook）。Colabではセル同士が同じ変数の置き場を
-# 共有しているので、起動時点で既存セルが作ったapp・whisper_model・clientを使える。
-# このセルを実行していなければ何も差し込まれないので、既存の動作は変わらない。
+# 使い方: このセルを実行するだけ（Googleドライブのマウント → Whisperの読み込み →
+# サーバー起動 → ngrokのURL表示 まで行う）。表示されたURLの末尾に /skill を付けて
+# スマホのブラウザで開く。事前にColabのシークレットに OPENAI_API_KEY と
+# NGROK_AUTH_TOKEN を登録しておく（Claudeを使う場合は ANTHROPIC_API_KEY も）。
 #
-# 対話研究のデータ（sessions / turns など）とは混ぜず、同じcorpus.dbの中に
-# skill_ で始まる表を別に作って保存する（docs/skill-transfer-mapping.md のQ1）。
+# 対話研究のパイプライン（audio_analysis_pipeline.py）とは独立して動く。DBも別の
+# ファイル（skill_transfer.db）に保存し、対話研究のデータには一切触れない。
+# 技術構成・書き方（FastAPI＋ngrok、SQLite、Whisper、ジョブを裏で動かして画面から
+# ポーリングする方式など）は、対話研究のパイプラインに合わせている。
 
-!pip install fastapi uvicorn python-multipart pydub noisereduce rapidfuzz weasyprint openai anthropic -q
+!pip install fastapi uvicorn pyngrok nest_asyncio python-multipart pydub openai-whisper noisereduce rapidfuzz weasyprint openai anthropic -q
 !apt-get -qq install -y fonts-noto-cjk > /dev/null
 
-import os, re, csv, json, shutil, sqlite3, inspect, threading, traceback, subprocess
+import os, io, re, csv, json, time, shutil, sqlite3, inspect, threading, traceback, subprocess
 from datetime import datetime
 from typing import Optional
 
@@ -25,7 +24,7 @@ import numpy as np
 
 # --- 1. 設定 ---
 # 秘密情報・設定値は環境変数から読む。ローカルでは .env、Colabではシークレット
-# （既存セルと同じ google.colab.userdata）から環境変数に入れる。
+# （google.colab.userdata）から環境変数に入れる。
 def load_dotenv(path=".env"):
     """KEY=VALUE 形式の .env を読み、まだ設定されていない環境変数だけを入れる。"""
     if not os.path.exists(path):
@@ -55,18 +54,20 @@ def load_colab_secrets(names):
 
 
 load_dotenv()
-load_colab_secrets(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"])
+load_colab_secrets(["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NGROK_AUTH_TOKEN"])
 
 
 def _env_bool(name, default):
     return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 
-# DBは既存セルと同じcorpus.db（skill_ の表だけを読み書きする）
-SKILL_DB_PATH = os.environ.get("SKILL_DB_PATH", "/content/drive/MyDrive/corpus.db")
+# 動画・写真・PDFとDBは、Colabを閉じても残るようにGoogleドライブに保存する
 SKILL_MEDIA_DIR = os.environ.get("SKILL_MEDIA_DIR", "/content/drive/MyDrive/skill_transfer")
-SKILL_SEED_CSV = os.environ.get("SKILL_SEED_CSV", os.path.join(SKILL_MEDIA_DIR, "seed", "skill_transfer_tags.csv"))
-SKILL_HTML_PATH = os.environ.get("SKILL_HTML_PATH", os.path.join(SKILL_MEDIA_DIR, "skill_transfer.html"))
+SKILL_DB_PATH = os.environ.get("SKILL_DB_PATH", os.path.join(SKILL_MEDIA_DIR, "skill_transfer.db"))
+# タグ一覧の初期データ。空欄ならこのセルに入っている初期データ（seed/skill_transfer_tags.csv と同じ）を使う
+SKILL_SEED_CSV = os.environ.get("SKILL_SEED_CSV", "")
+SKILL_WHISPER_MODEL = os.environ.get("SKILL_WHISPER_MODEL", "medium")
+SKILL_PORT = int(os.environ.get("SKILL_PORT", "8000"))
 SKILL_SUBTITLE_MAX_CHARS = int(os.environ.get("SKILL_SUBTITLE_MAX_CHARS", "20"))
 SKILL_SUBTITLE_MAX_LINES = int(os.environ.get("SKILL_SUBTITLE_MAX_LINES", "2"))
 SKILL_TAG_FUZZY_THRESHOLD = float(os.environ.get("SKILL_TAG_FUZZY_THRESHOLD", "85"))
@@ -83,12 +84,12 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# --- 2. DB（skill_ で始まる表だけを追加する。既存の表には触れない） ---
+# --- 2. DB（技能伝承専用の skill_transfer.db） ---
 def init_skill_db(conn):
-    # skill_videos: 作業動画1本（既存のsessionsに相当）。既存のsessionsは
+    # skill_videos: 作業動画1本（対話研究のsessionsに相当）。対話研究のsessionsは
     # 元の動画ファイルを保存しないが、技能伝承では再生が必要なので保存先を持つ。
     # 処理状態もここに永続化し、失敗した段階から再実行できるようにする
-    # （既存のjobs辞書はメモリ上だけなので、再起動で消えてしまう）。
+    # （メモリ上だけに持つと、Colabの再起動で消えてしまう）。
     conn.execute("""
         CREATE TABLE IF NOT EXISTS skill_videos (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +107,7 @@ def init_skill_db(conn):
             updated     TEXT
         )
     """)
-    # skill_segments: 時間付きの文字起こし（既存のturnsと同じ列構成）。
+    # skill_segments: 時間付きの文字起こし（対話研究のturnsと同じ列構成）。
     # 対話研究用のphase/intent/role/embeddingは持たない。
     conn.execute("""
         CREATE TABLE IF NOT EXISTS skill_segments (
@@ -139,7 +140,7 @@ def init_skill_db(conn):
             FOREIGN KEY (video_id) REFERENCES skill_videos(id)
         )
     """)
-    # skill_llm_results: LLMの生の出力（既存のaddin_resultsと同じ考え方）。
+    # skill_llm_results: LLMの生の出力（対話研究のaddin_resultsと同じ考え方）。
     # 手順分割やタグ抽出をやり直しても上書きせず、method_version付きで全部残す。
     conn.execute("""
         CREATE TABLE IF NOT EXISTS skill_llm_results (
@@ -186,15 +187,20 @@ def parse_aliases(text):
     return [a.strip() for a in (text or "").split("|") if a.strip()]
 
 
-def seed_skill_tags(conn, csv_path=SKILL_SEED_CSV):
+def seed_skill_tags(conn, csv_path=None):
     """
     タグ一覧の初期データ（列: name, category, parent, aliases）を投入する。
+    csv_pathを省略すると、このセルに入っている初期データ（SKILL_SEED_TAGS_CSV）を使う。
     同じ名前のタグが既にあれば上書きしない（管理画面で編集した内容を、
     セルの再実行で初期データに戻してしまわないため）。
     親は名前で指定し、CSV内の行の順番に関係なく解決する。
     """
-    with open(csv_path, encoding="utf-8-sig", newline="") as f:
-        rows = [r for r in csv.DictReader(f) if (r.get("name") or "").strip()]
+    if csv_path:
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            text = f.read()
+    else:
+        text = SKILL_SEED_TAGS_CSV
+    rows = [r for r in csv.DictReader(io.StringIO(text.lstrip("\ufeff"))) if (r.get("name") or "").strip()]
 
     now = now_str()
     inserted = 0
@@ -287,12 +293,10 @@ class SerializedConnection:
 
 
 def open_skill_db(path=None):
-    """
-    既存セルと同じcorpus.dbを、技能伝承用の別の接続で開く。既存セルの conn を
-    共有しないのは、技能伝承側の書き込み途中のトランザクションを既存の処理の
-    commitに巻き込まないため（逆も同じ）。設定は既存セルのinit_dbと揃えている。
-    """
-    conn = sqlite3.connect(path or SKILL_DB_PATH, check_same_thread=False, timeout=30)
+    """技能伝承のDB（skill_transfer.db）を開き、表を用意する。"""
+    path = path or SKILL_DB_PATH
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     init_skill_db(conn)
     return conn
@@ -340,7 +344,7 @@ def extract_frame(video_path, seconds, dst, width=640):
 def extract_audio(video_path, wav_path, denoise=True):
     """
     ① の1〜2: 動画から音声を取り出し、騒音を減らして16kHz・モノラルのWAVにする。
-    16kHz・モノラル化と音量正規化は既存セルのrun_full_analysis（A. 音声変換）と同じ処理。
+    16kHz・モノラル化と音量正規化は、対話研究のパイプラインの音声変換と同じ処理。
     重機や工具の音は一定ではないため、noisereduceは非定常（stationary=False）で使う。
     """
     from pydub import AudioSegment, effects as audio_effects
@@ -356,9 +360,9 @@ def extract_audio(video_path, wav_path, denoise=True):
 
 
 # --- 4. ① 文字起こし ---
-# 既存セルの transcribe_full_audio と同じ設定・同じフィルタ。既存セルは編集しない方針の
-# ため、言語指定と専門用語ヒントを足したものをここに複製している。既存側のフィルタを
-# 変更した場合はこちらにも反映すること（transcription_accuracy_tool.py と同じ扱い）。
+# 対話研究のパイプライン（audio_analysis_pipeline.py の transcribe_full_audio）で実データに
+# 合わせて調整した設定・幻覚フィルタと同じ値に、言語指定と専門用語ヒントを足している。
+# このセルは独立して動くので、値はここに持っている。
 SKILL_WHISPER_NO_SPEECH_THRESHOLD = 0.6
 SKILL_WHISPER_LOGPROB_THRESHOLD = -1.0
 SKILL_WHISPER_COMPRESSION_RATIO_THRESHOLD = 2.4
@@ -412,7 +416,7 @@ def transcribe_skill_audio(audio_path, whisper_model, language=SKILL_WHISPER_LAN
     """
     音声全体をWhisperに1回で通し、セグメント（単語のタイムスタンプ付き）を返す。
     temperature=0.0 / word_timestamps=True / condition_on_previous_text=False と
-    幻覚フィルタは既存セルと同じ（理由は既存セルのコメント参照）。
+    幻覚フィルタは対話研究のパイプラインと同じ（理由は audio_analysis_pipeline.py のコメント参照）。
     condition_on_previous_text=False のままだと initial_prompt は最初の30秒にしか
     効かないため、carry_initial_prompt に対応した版では全区間に付ける。
     """
@@ -472,8 +476,9 @@ def split_sentences(whisper_segments):
 
 def mask_sentences(sentences, mask_fn):
     """
-    設定でONのときだけ、既存セルの匿名化（extract_mask_targets_with_gpt）を使って
-    固有名詞を[MASK]に置き換える。既定はOFF（道具やメーカーの名前まで伏せてしまうため）。
+    設定でONのときだけ、匿名化すべき言葉（人名・会社名・現場名・連絡先など）を
+    [MASK]に置き換える。既定はOFF（道具やメーカーの名前まで伏せてしまうため）。
+    mask_fn(sentences) は [{"word": ...}, ...] を返す関数（既定は extract_mask_words）。
     """
     for target in mask_fn(sentences):
         word = target.get("word")
@@ -566,7 +571,7 @@ def build_webvtt(segments, max_chars=SKILL_SUBTITLE_MAX_CHARS, max_lines=SKILL_S
 
 
 # --- 6. 処理の流れ（状態の記録と、失敗した段階からの再実行） ---
-# 既存セルのjobs辞書はメモリ上だけなので、Colabの再起動で消えてしまう。技能伝承では
+# 処理の状態をメモリ上だけに持つと、Colabの再起動で消えてしまう。技能伝承では
 # 状態・失敗した段階・エラー内容をskill_videosに残し、画面から失敗した段階だけを
 # やり直せるようにする。
 VIDEO_COLUMNS = ["id", "title", "explainer", "filename", "media_path", "duration", "status",
@@ -574,7 +579,7 @@ VIDEO_COLUMNS = ["id", "title", "explainer", "filename", "media_path", "duration
 
 
 class SkillContext:
-    """技能伝承の処理に必要なもの一式。Colabでは既存セルのモデル・クライアントを入れる。"""
+    """技能伝承の処理に必要なもの一式（DB、保存先、Whisperモデル、LLMなど）。"""
 
     def __init__(self, conn, media_dir=SKILL_MEDIA_DIR, whisper_model=None, llm_fn=None,
                  mask_fn=None, anonymize=SKILL_ANONYMIZE, difficulty=SKILL_DIFFICULTY_TAG,
@@ -691,7 +696,7 @@ def start_skill_pipeline(ctx, video_id, start_step=None):
 
 
 # --- 7. LLMの呼び出し（1か所にまとめる） ---
-# 既定は既存セルと同じOpenAI（gpt-4o・JSONモード）。SKILL_LLM_PROVIDER=anthropic で
+# 既定は対話研究のパイプラインと同じOpenAI（gpt-4o・JSONモード）。SKILL_LLM_PROVIDER=anthropic で
 # Claudeに切り替えられる。どちらも「プロンプトを渡してJSONの文字列を受け取る」関数
 # （llm_fn）として扱い、手順書・タグ付けはこの関数だけを使う。テストではこの関数を
 # モックに差し替える。
@@ -775,6 +780,28 @@ def save_llm_result(conn, video_id, kind, method_version, result):
         (video_id, kind, method_version, now_str(), json.dumps(result, ensure_ascii=False))
     )
     conn.commit()
+
+
+def extract_mask_words(llm_fn, sentences):
+    """匿名化すべき言葉をLLMで全文から抜き出す（SKILL_ANONYMIZE=true のときだけ使う）。"""
+    lines = "\n".join(s["text"] for s in sentences)
+    prompt = f"""# task: mask
+次の作業説明の文字起こしから、匿名化が必要な言葉（人名、会社名、現場名・工事名、電話番号、
+メールアドレス、住所など）を抜き出してください。道具・資材・工法などの一般的な言葉は含めないでください。
+
+{lines}
+
+次の形のJSONだけを返してください: {{"mask_list": [{{"word": "..."}}]}}
+"""
+
+    def validate(data):
+        words = data.get("mask_list")
+        if not isinstance(words, list):
+            raise ValueError("mask_list がありません")
+        return [w for w in words if isinstance(w, dict) and str(w.get("word", "")).strip()]
+
+    result, _ = call_llm_json(llm_fn, prompt, validate)
+    return result
 
 
 # --- 8. ② 手順書 ---
@@ -1454,17 +1481,15 @@ def create_skill_router(ctx):
     @router.get("/skill", response_class=HTMLResponse)
     def api_skill_page():
         # スマホからは「ngrokのURL/skill」で開く（同じ所から配信すると、動画や字幕も
-        # ngrokの警告ページに止められずに読み込める）
-        if not os.path.exists(ctx.html_path):
-            return HTMLResponse(
-                "<meta charset='utf-8'><p>画面のファイル（skill_transfer.html）が見つかりません。"
-                f"Google Driveの {ctx.html_path} に置いてから、セルを実行し直してください。</p>",
-                status_code=404)
-        with open(ctx.html_path, encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+        # ngrokの警告ページに止められずに読み込める）。画面はこのセルの中のHTML（12.）
+        return HTMLResponse(SKILL_PAGE_HTML)
+
+    @router.get("/")
+    def api_root():
+        return HTMLResponse("<meta charset='utf-8'><p>技能伝承動画の画面は <a href='/skill'>/skill</a> です。</p>")
 
     @router.post("/skill/api/videos")
-    # 既存の/uploadと同じく、重い処理を待たずにIDをすぐ返し、処理は裏で行う
+    # 対話研究の/uploadと同じく、重い処理を待たずにIDをすぐ返し、処理は裏で行う
     # （ngrok無料枠のタイムアウト対策）。画面は /skill/api/videos/{id} で状態を確認する。
     def api_skill_upload(file: UploadFile = File(...), title: str = Form(...), explainer: str = Form("")):
         title = title.strip()
@@ -1622,15 +1647,14 @@ def create_skill_router(ctx):
 
 
 def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=None, mask_fn=None,
-                            llm_fn=None, media_dir=None, seed_csv=None, html_path=None, run_in_background=True):
+                            llm_fn=None, media_dir=None, seed_csv=None, run_in_background=True):
     """
-    技能伝承のAPIを既存のFastAPIアプリに追加する。既存のルートには触れない。
-    タグ一覧が空のときだけ初期データ（seed CSV）を入れる。
+    技能伝承の画面とAPIをFastAPIアプリに登録する。
+    タグ一覧が空のときだけ初期データを入れる。
     保存先などを省略したときは、呼び出した時点の設定（SKILL_MEDIA_DIR など）を使う。
     """
     media_dir = media_dir or SKILL_MEDIA_DIR
-    seed_csv = seed_csv or SKILL_SEED_CSV
-    html_path = html_path or SKILL_HTML_PATH
+    seed_csv = seed_csv or SKILL_SEED_CSV or None
     if conn is None:
         conn = open_skill_db()
     else:
@@ -1638,54 +1662,820 @@ def register_skill_transfer(app, conn=None, whisper_model=None, openai_client=No
     if not isinstance(conn, SerializedConnection):
         conn = SerializedConnection(conn)
     os.makedirs(media_dir, exist_ok=True)
-    if conn.execute("SELECT COUNT(*) FROM skill_tags").fetchone()[0] == 0 and os.path.exists(seed_csv):
+    if conn.execute("SELECT COUNT(*) FROM skill_tags").fetchone()[0] == 0:
         print("技能伝承: タグ一覧の初期データを投入しました", seed_skill_tags(conn, seed_csv))
     if llm_fn is None:
         llm_fn = make_llm_fn(openai_client=openai_client)
+    if mask_fn is None:
+        mask_fn = lambda sentences: extract_mask_words(llm_fn, sentences)
     ctx = SkillContext(conn, media_dir=media_dir, whisper_model=whisper_model, llm_fn=llm_fn,
                        mask_fn=mask_fn, run_in_background=run_in_background)
     ctx.openai_client = openai_client
-    ctx.html_path = html_path
     app.include_router(create_skill_router(ctx))
     app.state.skill_transfer = ctx
     return ctx
 
 
-# --- 12. 既存セルのサーバー起動時に自動で登録する仕組み ---
-def install_skill_transfer_hook(namespace=None):
-    """
-    uvicorn.Server.serve を包み、サーバー起動の直前に register_skill_transfer を呼ぶ。
-    既存セルを編集せずに技能伝承のAPIを追加するための仕組み。namespace（省略時はこの
-    セルの変数の置き場＝Colabでは全セル共通）から、既存セルが作ったWhisperモデル・
-    OpenAIクライアント・匿名化関数を受け取る。登録に失敗しても既存のサーバーは起動する。
-    """
-    import uvicorn
+def build_skill_app(whisper_model, openai_client=None, conn=None, **kwargs):
+    """技能伝承だけのFastAPIアプリを作る（CORSの設定は対話研究のパイプラインと同じ）。"""
     from fastapi import FastAPI
-
-    original = getattr(uvicorn.Server, "_skill_transfer_original_serve", None) or uvicorn.Server.serve
-    ns = namespace if namespace is not None else globals()
-
-    async def serve_with_skill_transfer(self, *args, **kwargs):
-        app = self.config.app
-        if isinstance(app, FastAPI) and getattr(app.state, "skill_transfer", None) is None:
-            try:
-                register_skill_transfer(
-                    app,
-                    whisper_model=ns.get("whisper_model"),
-                    openai_client=ns.get("client"),
-                    mask_fn=ns.get("extract_mask_targets_with_gpt"),
-                )
-                print("✅ 技能伝承機能を登録しました（画面: 表示されたURLの末尾に /skill を付けて開く）")
-            except Exception:
-                traceback.print_exc()
-                print("⚠️ 技能伝承機能の登録に失敗しました。既存の機能はそのまま起動します。")
-        return await original(self, *args, **kwargs)
-
-    uvicorn.Server._skill_transfer_original_serve = original
-    uvicorn.Server.serve = serve_with_skill_transfer
+    from fastapi.middleware.cors import CORSMiddleware
+    app = FastAPI()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+    register_skill_transfer(app, conn=conn, whisper_model=whisper_model, openai_client=openai_client, **kwargs)
+    return app
 
 
-if __name__ == "__main__":
-    # Colabのセルとして実行されたときだけ差し込む（pytestから読み込むときは差し込まない）
-    install_skill_transfer_hook()
-    print("技能伝承セルの準備ができました。続けて audio_analysis_pipeline.py のセルを実行してください。")
+# --- 12. 画面（HTML）とタグ一覧の初期データ ---
+# 1つのセルで完結させるため、画面とタグ一覧の初期データもこのセルに入れている。
+# タグ一覧の初期データは seed/skill_transfer_tags.csv と同じ内容（列: name, category, parent, aliases）。
+# 運用で変えたいときは、画面の「タグ管理」で編集する（セルを実行し直しても上書きしない）。
+SKILL_SEED_TAGS_CSV = """name,category,parent,aliases
+躯体工事,作業,,
+型枠工事,作業,躯体工事,型枠|かたわく
+型枠組立,作業,型枠工事,型枠の組立|建て込み|建込み
+型枠解体,作業,型枠工事,ばらし|解体
+鉄筋工事,作業,躯体工事,
+配筋,作業,鉄筋工事,鉄筋組立|鉄筋の組立
+鉄筋結束,作業,鉄筋工事,結束|結束作業
+コンクリート打設,作業,躯体工事,打設|生コン打設|コン打ち
+仕上工事,作業,,
+内装工事,作業,仕上工事,内装
+軽量鉄骨下地,作業,内装工事,LGS|軽鉄下地|軽天
+ボード張り,作業,内装工事,石膏ボード張り|PB張り|ボード貼り
+左官工事,作業,仕上工事,左官
+モルタル塗り,作業,左官工事,モル塗り
+タイル張り,作業,仕上工事,タイル貼り|タイル
+仮設工事,作業,,
+足場組立,作業,仮設工事,足場|足場の組立
+墨出し,作業,仮設工事,墨打ち|墨付け
+インパクトドライバー,道具,,インパクト|インパクトドライバ
+電動丸のこ,道具,,丸のこ|丸ノコ|マルノコ
+ハッカー,道具,,結束ハッカー
+レベル,道具,,水平器|水準器|水平
+墨つぼ,道具,,墨壺|すみつぼ
+レーザー墨出し器,道具,,レーザー|墨出し器
+コテ,道具,,鏝|左官ごて
+バイブレーター,道具,,バイブ|振動機
+メジャー,道具,,コンベックス|スケール
+石膏ボード,資材,,プラスターボード|PB
+コンパネ,資材,,合板|型枠用合板|ベニヤ
+セパレーター,資材,,セパ
+鉄筋,資材,,異形鉄筋|D13|D10
+結束線,資材,,番線|なまし鉄線
+軽量鉄骨,資材,,スタッド|ランナー
+ビス,資材,,ねじ|ネジ
+モルタル,資材,,
+墜落防止,安全,,墜落|転落|安全帯|フルハーネス
+保護具,安全,,ヘルメット|保護メガネ|手袋
+初級,難易度,,
+中級,難易度,,
+上級,難易度,,
+"""
+
+SKILL_PAGE_HTML = r'''<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>技能伝承動画</title>
+    <style>
+        :root {
+            --accent: #e67e00; --accent-dark: #b86400; --bg: #f6f6f4; --card: #ffffff;
+            --text: #222; --sub: #666; --line: #ddd; --danger: #c62828; --tip: #0b5394; --ok: #2e7d32;
+        }
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: sans-serif; line-height: 1.6; color: var(--text); background: var(--bg); }
+        header { position: sticky; top: 0; z-index: 10; background: #333; color: #fff; padding: 8px 12px;
+                 display: flex; align-items: center; gap: 8px; }
+        header h1 { font-size: 1.05em; margin: 0; flex: 1; white-space: nowrap; }
+        header a { color: #fff; text-decoration: none; background: #555; padding: 8px 12px; border-radius: 6px; font-size: 0.9em; }
+        header a.upload { background: var(--accent); }
+        .container { max-width: 960px; margin: 0 auto; padding: 12px; }
+        .section { background: var(--card); padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid var(--line); }
+        h2 { font-size: 1.1em; margin: 0 0 8px; border-left: 5px solid var(--accent); padding-left: 8px; }
+        .muted { color: var(--sub); font-size: 0.9em; }
+        .error { color: var(--danger); }
+        button, .button { font-size: 1em; border: none; border-radius: 8px; padding: 12px 14px; cursor: pointer;
+                          background: #e0e0e0; color: var(--text); text-decoration: none; display: inline-block; text-align: center; }
+        button.primary, .button.primary { background: var(--accent); color: #fff; font-weight: bold; }
+        button.small { padding: 6px 10px; font-size: 0.85em; }
+        button:disabled { opacity: 0.5; }
+        input[type=text], select { font-size: 1em; padding: 10px; width: 100%; border: 1px solid #bbb; border-radius: 6px; }
+        label { display: block; font-weight: bold; margin: 10px 0 4px; }
+        .big-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .big-buttons button, .big-buttons .button { padding: 18px 8px; font-size: 1.05em; }
+        .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+        .chip { border: 1px solid #bbb; background: #fff; border-radius: 16px; padding: 4px 12px; font-size: 0.9em; cursor: pointer; }
+        a.chip { text-decoration: none; color: var(--text); }
+        .chip.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
+        .chip .cat { font-size: 0.75em; color: var(--sub); margin-right: 4px; }
+        .chip.selected .cat { color: #ffe0b2; }
+
+        /* アップロード */
+        .file-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .file-buttons label { margin: 0; padding: 18px 8px; text-align: center; border-radius: 8px; background: #e0e0e0; cursor: pointer; font-weight: bold; }
+        .file-buttons label.camera { background: var(--accent); color: #fff; }
+        .file-buttons input { display: none; }
+        progress { width: 100%; height: 14px; }
+        .steps-status { list-style: none; padding: 0; margin: 8px 0; }
+        .steps-status li { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+        .steps-status li.done::before { content: "✔ "; color: var(--ok); }
+        .steps-status li.running { font-weight: bold; color: var(--accent-dark); }
+        .steps-status li.running::before { content: "▶ "; }
+        .steps-status li.failed { color: var(--danger); font-weight: bold; }
+        .steps-status li.failed::before { content: "✖ "; }
+        .steps-status li.waiting { color: var(--sub); }
+        .steps-status li.waiting::before { content: "・ "; }
+
+        /* 再生 */
+        .player-wrap { background: #000; border-radius: 8px; overflow: hidden; }
+        video { width: 100%; max-height: 60vh; display: block; background: #000; }
+        video::cue { font-size: 1.1em; background: rgba(0,0,0,0.75); }
+        .scene-bar { position: relative; height: 26px; background: #444; cursor: pointer; }
+        .scene-bar .mark { position: absolute; top: 3px; bottom: 3px; background: var(--accent); border-left: 2px solid #fff;
+                           color: #fff; font-size: 0.7em; overflow: hidden; white-space: nowrap; padding-left: 2px; }
+        .scene-bar .mark:nth-child(even) { background: #ffa726; }
+        .scene-bar .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; pointer-events: none; }
+        .player-tools { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+        .step-card { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+        .step-card.current { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; }
+        .step-head { display: flex; align-items: center; gap: 8px; background: #fff3e0; padding: 8px 10px; cursor: pointer; }
+        .step-head .time { font-family: monospace; color: var(--accent-dark); font-weight: bold; }
+        .step-head .title { font-weight: bold; flex: 1; }
+        .step-body { padding: 8px 10px; font-size: 0.95em; }
+        .step-body .label { font-weight: bold; margin-right: 4px; }
+        .step-body .caution { color: var(--danger); }
+        .step-body .tip { color: var(--tip); }
+        .transcript p { margin: 0; padding: 4px 0; border-bottom: 1px dotted var(--line); cursor: pointer; }
+        .transcript .time { font-family: monospace; color: var(--sub); margin-right: 6px; }
+        details summary { cursor: pointer; font-weight: bold; padding: 4px 0; }
+
+        /* ホーム・一覧 */
+        .breadcrumb { font-size: 0.9em; margin-bottom: 8px; }
+        .breadcrumb a { color: var(--accent-dark); }
+        .work-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .work-grid a { display: block; background: #fff; border: 2px solid var(--accent); color: var(--text); text-decoration: none;
+                       border-radius: 10px; padding: 16px 8px; text-align: center; font-weight: bold; font-size: 1.05em; }
+        .work-grid a .more { display: block; font-size: 0.75em; color: var(--sub); font-weight: normal; }
+        .filter-group { margin-bottom: 6px; }
+        .filter-group .group-label { font-size: 0.8em; color: var(--sub); margin-bottom: 2px; }
+        .video-card { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); text-decoration: none; color: var(--text); }
+        .video-card img, .video-card .noimg { width: 120px; height: 68px; object-fit: cover; border-radius: 6px; background: #ccc; flex: none; }
+        .video-card .info { flex: 1; min-width: 0; }
+        .video-card .title { font-weight: bold; }
+        .video-card .chips .chip { font-size: 0.75em; padding: 1px 8px; cursor: default; }
+        .status-badge { font-size: 0.75em; padding: 1px 8px; border-radius: 10px; background: #eee; }
+        .status-badge.error { background: #ffebee; color: var(--danger); }
+
+        /* タグ管理（PC想定） */
+        table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
+        th, td { border-bottom: 1px solid var(--line); padding: 6px; text-align: left; vertical-align: top; }
+        th { background: #fafafa; }
+        td.actions { white-space: nowrap; }
+        .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; align-items: end; }
+        .inline-form { background: #fff8e1; padding: 8px; border-radius: 6px; margin-top: 6px; }
+        .notice { background: #e8f5e9; padding: 8px; border-radius: 6px; margin-bottom: 8px; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🦺 技能伝承動画</h1>
+        <a href="#/">ホーム</a>
+        <a href="#/upload" class="upload">撮影・投稿</a>
+    </header>
+    <div class="container" id="app"></div>
+
+    <script>
+        // Colab の ngrok URL の末尾に /skill を付けて開く（配信元をそのまま使う）。
+        // この画面をファイルとして保存してPCで直接開く場合は、ここに ngrok URL を貼り付ける。
+        const BASE_URL = location.protocol.startsWith("http") ? location.origin : "https://xxxx.ngrok-free.dev";
+        const NGROK_HEADERS = { 'ngrok-skip-browser-warning': 'true' };
+
+        const STEP_LABELS = [
+            ["media", "動画の変換"],
+            ["transcribe", "文字起こし・字幕"],
+            ["procedure", "手順書"],
+            ["tagging", "タグ付け"],
+        ];
+        const app = document.getElementById('app');
+        let pollTimer = null;
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // 文字起こしやタグ名は利用者の入力・AIの出力なので、必ずエスケープしてから表示する
+        function esc(text) {
+            return String(text ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+        }
+
+        function clock(seconds) {
+            const s = Math.floor(seconds || 0);
+            return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+        }
+
+        async function api(path, options = {}) {
+            const response = await fetch(`${BASE_URL}${path}`, {
+                ...options,
+                headers: { ...NGROK_HEADERS, ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) },
+            });
+            const text = await response.text();
+            const data = text ? JSON.parse(text) : {};
+            if (!response.ok) {
+                throw new Error(data.detail || `サーバーエラー(${response.status})`);
+            }
+            return data;
+        }
+
+        // --- 画面の切り替え（#/〜 で画面を表す。タップで戻る・進むができるように） ---
+        function route() {
+            clearTimeout(pollTimer);
+            const [path, query] = location.hash.replace(/^#/, "").split("?");
+            const params = new URLSearchParams(query || "");
+            const parts = (path || "/").split("/").filter(Boolean);
+            window.scrollTo(0, 0);
+            if (parts[0] === "upload") return renderUpload();
+            if (parts[0] === "video" && parts[1]) return renderVideo(Number(parts[1]), params);
+            if (parts[0] === "list") return renderList(params);
+            if (parts[0] === "tags") return renderTags();
+            return renderHome(params);
+        }
+        window.addEventListener("hashchange", route);
+
+        function showError(err) {
+            app.innerHTML = `<div class="section error">エラー: ${esc(err.message)}</div>`;
+        }
+
+        // --- タグ一覧（作業の種類の階層をたどるために使う） ---
+        async function loadTags() {
+            const data = await api("/skill/api/tags");
+            const byId = Object.fromEntries(data.tags.map(t => [t.tag_id, t]));
+            const children = id => data.tags.filter(t => t.parent_id === id);
+            const ancestors = id => {
+                const chain = [];
+                for (let t = byId[id]; t; t = byId[t.parent_id]) chain.unshift(t);
+                return chain;
+            };
+            return { ...data, byId, children, ancestors };
+        }
+
+        function breadcrumb(tags, workId, linkLast) {
+            const chain = workId ? tags.ancestors(workId) : [];
+            const items = [`<a href="#/">ホーム</a>`].concat(chain.map((t, i) =>
+                i === chain.length - 1 && !linkLast ? esc(t.name) : `<a href="#/?work=${t.tag_id}">${esc(t.name)}</a>`));
+            return `<div class="breadcrumb">${items.join(" ＞ ")}</div>`;
+        }
+
+        // --- ホーム（作業の種類のボタンを、階層をタップでたどる） ---
+        async function renderHome(params) {
+            let tags;
+            try {
+                tags = await loadTags();
+            } catch (err) {
+                return showError(err);
+            }
+            const workId = params.get("work") ? Number(params.get("work")) : null;
+            const current = workId ? tags.byId[workId] : null;
+            const items = tags.children(workId).filter(t => t.category === "作業");
+            const buttons = items.map(t => {
+                const hasChildren = tags.children(t.tag_id).length > 0;
+                // 下位の分類があればさらにたどり、無ければその作業の動画一覧へ
+                const href = hasChildren ? `#/?work=${t.tag_id}` : `#/list?work=${t.tag_id}`;
+                return `<a href="${href}" class="work-button">${esc(t.name)}<span class="more">${hasChildren ? "さらに選ぶ ▶" : "動画を見る"}</span></a>`;
+            }).join("");
+            const allLink = current
+                ? `<a class="button primary" href="#/list?work=${current.tag_id}">「${esc(current.name)}」の動画をすべて見る</a>`
+                : `<a class="button primary" href="#/list">すべての動画を見る</a>`;
+            app.innerHTML = `
+                <div class="section">
+                    ${current ? breadcrumb(tags, workId, false) : ""}
+                    <h2>${current ? esc(current.name) : "作業の種類を選ぶ"}</h2>
+                    <div class="work-grid">${buttons || '<p class="muted">下位の分類はありません</p>'}</div>
+                    <p>${allLink}</p>
+                </div>
+                ${current ? "" : `
+                <div class="section">
+                    <h2>動画を増やす</h2>
+                    <p class="muted">熟練者が作業しながら説明する様子を撮影して投稿すると、字幕・手順書・タグが自動で作られます。</p>
+                    <a class="button primary" href="#/upload">📹 撮影・投稿する</a>
+                    <p class="muted" style="margin-top:12px"><a href="#/tags">タグ一覧の管理（PC向け）</a></p>
+                </div>`}`;
+        }
+
+        // --- 動画一覧（上部のタグボタンで絞り込み。複数選ぶと、すべてを持つ動画だけ） ---
+        function listHash(workId, tagIds) {
+            const q = new URLSearchParams();
+            if (workId) q.set("work", workId);
+            if (tagIds.length) q.set("tags", tagIds.join(","));
+            const qs = q.toString();
+            return `#/list${qs ? "?" + qs : ""}`;
+        }
+
+        function videoCard(v) {
+            const thumb = v.thumbnail_url ? `<img src="${BASE_URL}${v.thumbnail_url}" alt="" loading="lazy">` : `<div class="noimg"></div>`;
+            const chips = (v.video_tags || []).slice(0, 6).map(t => `<span class="chip">${esc(t.name)}</span>`).join("");
+            return `<a class="video-card" href="#/video/${v.video_id}">${thumb}
+                <div class="info"><div class="title">${esc(v.title)}</div>
+                <div class="muted">${clock(v.duration)}${v.explainer ? "　" + esc(v.explainer) : ""}</div>
+                <div class="chips">${chips}</div></div></a>`;
+        }
+
+        async function renderList(params) {
+            const workId = params.get("work") ? Number(params.get("work")) : null;
+            const selected = (params.get("tags") || "").split(",").filter(Boolean).map(Number);
+            let tags, data;
+            try {
+                tags = await loadTags();
+                data = await api(`/skill/api/videos?${new URLSearchParams({ ...(workId ? { work_tag: workId } : {}), tags: selected.join(",") })}`);
+            } catch (err) {
+                return showError(err);
+            }
+            const work = workId ? tags.byId[workId] : null;
+            // 絞り込みボタン: 表示中の動画に付いているタグ（＋選択中のタグ）を分類ごとに並べる
+            const facets = [...data.facets];
+            for (const id of selected) {
+                if (!facets.some(f => f.tag_id === id) && tags.byId[id]) facets.push({ ...tags.byId[id], count: 0 });
+            }
+            const groups = {};
+            for (const f of facets) {
+                if (f.tag_id === workId) continue;
+                (groups[f.category] ||= []).push(f);
+            }
+            const filterHtml = tags.categories.filter(c => groups[c]).map(c => `
+                <div class="filter-group"><div class="group-label">${esc(c)}</div><div class="chips">
+                ${groups[c].map(f => {
+                    const on = selected.includes(f.tag_id);
+                    const next = on ? selected.filter(id => id !== f.tag_id) : [...selected, f.tag_id];
+                    return `<a class="chip tag-filter ${on ? "selected" : ""}" href="${listHash(workId, next)}">${esc(f.name)}${on ? " ✕" : ` (${f.count})`}</a>`;
+                }).join("")}</div></div>`).join("");
+            app.innerHTML = `
+                <div class="section">
+                    ${breadcrumb(tags, workId, true)}
+                    <h2>${work ? esc(work.name) + " の動画" : "すべての動画"}（${data.videos.length}件）</h2>
+                    ${filterHtml ? `<p class="muted" style="margin:0 0 4px">タグで絞り込み（複数選ぶと、すべてに当てはまる動画だけ）</p>${filterHtml}` : ""}
+                    ${selected.length ? `<p><a class="button small" href="${listHash(workId, [])}">絞り込みを解除</a></p>` : ""}
+                </div>
+                <div class="section" id="video-list">
+                    ${data.videos.map(videoCard).join("") || '<p class="muted">該当する動画がありません</p>'}
+                </div>`;
+        }
+
+        // --- アップロード ---
+        function renderUpload() {
+            app.innerHTML = `
+                <div class="section">
+                    <h2>動画を撮影・投稿</h2>
+                    <div class="file-buttons">
+                        <label class="camera">📹 撮影する<input type="file" id="camera-input" accept="video/*" capture="environment"></label>
+                        <label>📁 ファイル選択<input type="file" id="file-input" accept="video/*"></label>
+                    </div>
+                    <p id="file-name" class="muted">動画が選ばれていません</p>
+                    <label for="title">タイトル（作業の内容）</label>
+                    <input type="text" id="title" placeholder="例: 型枠の建て込み">
+                    <label for="explainer">説明者（任意）</label>
+                    <input type="text" id="explainer" placeholder="例: 山田">
+                    <p><button class="primary" id="upload-button" onclick="uploadVideo()">投稿する</button></p>
+                    <div id="upload-progress" style="display:none">
+                        <p class="muted" id="upload-text">アップロード中...</p>
+                        <progress id="upload-bar" max="100" value="0"></progress>
+                    </div>
+                    <div id="status-area"></div>
+                </div>
+                <div class="section">
+                    <h2>最近の投稿（処理の状況）</h2>
+                    <div id="recent-uploads" class="muted">読み込み中...</div>
+                </div>`;
+            loadRecentUploads();
+            let selected = null;
+            for (const id of ["camera-input", "file-input"]) {
+                document.getElementById(id).addEventListener("change", e => {
+                    selected = e.target.files[0] || selected;
+                    document.getElementById("file-name").textContent = selected ? `選んだ動画: ${selected.name}` : "動画が選ばれていません";
+                });
+            }
+            window.selectedFile = () => selected;
+        }
+
+        const STATUS_TEXT = { uploaded: "受付", media: "動画の変換中", transcribe: "文字起こし中", procedure: "手順書の作成中",
+                              tagging: "タグ付け中", done: "完了", error: "失敗" };
+
+        async function loadRecentUploads() {
+            const box = document.getElementById("recent-uploads");
+            try {
+                const data = await api("/skill/api/videos?include_unfinished=true");
+                box.innerHTML = data.videos.slice(0, 10).map(v =>
+                    `<a class="video-card" href="#/video/${v.video_id}"><div class="info"><div class="title">${esc(v.title)}</div>
+                     <span class="status-badge ${v.status === "error" ? "error" : ""}">${STATUS_TEXT[v.status] || esc(v.status)}</span>
+                     <span class="muted">${esc(v.created)}</span></div></a>`).join("") || "まだ投稿はありません";
+                box.classList.remove("muted");
+            } catch (err) {
+                box.textContent = "取得できませんでした: " + err.message;
+            }
+        }
+
+        function uploadVideo() {
+            const file = window.selectedFile();
+            const title = document.getElementById("title").value.trim();
+            if (!file) return alert("動画を撮影するか、ファイルを選んでください");
+            if (!title) return alert("タイトルを入力してください");
+
+            const formData = new FormData();
+            formData.append("file", file);
+            formData.append("title", title);
+            formData.append("explainer", document.getElementById("explainer").value.trim());
+
+            // fetch ではアップロードの進み具合が分からないため、XMLHttpRequest を使う
+            // （スマホの動画は大きく、送信に時間がかかるため）
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", `${BASE_URL}/skill/api/videos`);
+            xhr.setRequestHeader("ngrok-skip-browser-warning", "true");
+            document.getElementById("upload-button").disabled = true;
+            document.getElementById("upload-progress").style.display = "block";
+            xhr.upload.onprogress = e => {
+                if (e.lengthComputable) {
+                    const pct = Math.round(e.loaded / e.total * 100);
+                    document.getElementById("upload-bar").value = pct;
+                    document.getElementById("upload-text").textContent = `アップロード中... ${pct}%`;
+                }
+            };
+            xhr.onload = () => {
+                let data = {};
+                try { data = JSON.parse(xhr.responseText); } catch (e) { }
+                if (xhr.status !== 200) {
+                    document.getElementById("upload-button").disabled = false;
+                    return alert("アップロードに失敗しました: " + (data.detail || xhr.status));
+                }
+                document.getElementById("upload-text").textContent = "アップロード完了。自動処理を行っています（数分かかることがあります）";
+                pollStatus(data.video_id);
+            };
+            xhr.onerror = () => {
+                document.getElementById("upload-button").disabled = false;
+                alert("アップロードに失敗しました。通信状態を確認してください。");
+            };
+            xhr.send(formData);
+        }
+
+        function renderStatus(video) {
+            const names = STEP_LABELS.map(s => s[0]);
+            const current = video.status === "error" ? video.failed_step : video.status;
+            const currentIndex = video.status === "done" ? names.length : names.indexOf(current);
+            const items = STEP_LABELS.map(([name, label], i) => {
+                let cls = "waiting";
+                if (i < currentIndex) cls = "done";
+                else if (i === currentIndex) cls = video.status === "error" ? "failed" : "running";
+                return `<li class="${cls}">${label}</li>`;
+            }).join("");
+            let footer = "";
+            if (video.status === "done") {
+                footer = `<a class="button primary" href="#/video/${video.video_id}">動画を見る</a>`;
+            } else if (video.status === "error") {
+                footer = `<p class="error">失敗しました: ${esc(video.error)}</p>
+                          <button class="primary" onclick="retryVideo(${video.video_id})">失敗したところから再実行</button>`;
+            }
+            return `<h2>処理の状況: ${esc(video.title)}</h2><ul class="steps-status">${items}</ul>${footer}`;
+        }
+
+        async function pollStatus(videoId) {
+            const area = document.getElementById("status-area");
+            if (!area) return;
+            try {
+                const video = await api(`/skill/api/videos/${videoId}`);
+                area.innerHTML = renderStatus(video);
+                if (video.status !== "done" && video.status !== "error") {
+                    pollTimer = setTimeout(() => pollStatus(videoId), 3000);
+                } else if (document.getElementById("recent-uploads")) {
+                    loadRecentUploads();
+                }
+            } catch (err) {
+                area.innerHTML = `<p class="error">状況を取得できませんでした: ${esc(err.message)}</p>`;
+                pollTimer = setTimeout(() => pollStatus(videoId), 3000);
+            }
+        }
+
+        async function retryVideo(videoId) {
+            try {
+                await api(`/skill/api/videos/${videoId}/retry`, { method: "POST" });
+                pollStatus(videoId);
+            } catch (err) {
+                alert("再実行できませんでした: " + err.message);
+            }
+        }
+
+        // --- タグ一覧の管理（PC想定）: 追加・編集・削除、別名の登録、新タグ候補の採用 ---
+        let tagState = null;
+
+        function parseAliases(text) {
+            return text.split(/[|｜、,，\n]/).map(a => a.trim()).filter(Boolean);
+        }
+
+        function tagOptions(filter, selectedId, emptyLabel) {
+            const rows = tagState.tags.filter(filter).map(t =>
+                `<option value="${t.tag_id}" ${t.tag_id === selectedId ? "selected" : ""}>${esc(tagState.ancestors(t.tag_id).map(a => a.name).join(" ＞ "))}</option>`);
+            return (emptyLabel ? [`<option value="">${emptyLabel}</option>`] : []).concat(rows).join("");
+        }
+
+        function categoryOptions(selected) {
+            return tagState.categories.map(c => `<option ${c === selected ? "selected" : ""}>${esc(c)}</option>`).join("");
+        }
+
+        async function renderTags(message) {
+            try {
+                tagState = await loadTags();
+                tagState.candidates = (await api("/skill/api/tag_candidates")).candidates;
+            } catch (err) {
+                return showError(err);
+            }
+            const depth = t => tagState.ancestors(t.tag_id).length - 1;
+            const ordered = [];
+            const walk = (parentId, category) => {
+                for (const t of tagState.tags.filter(t => t.parent_id === parentId && t.category === category)) {
+                    ordered.push(t);
+                    walk(t.tag_id, category);
+                }
+            };
+            const tables = tagState.categories.map(c => {
+                ordered.length = 0;
+                walk(null, c);
+                const rows = ordered.map(t => `<tr id="tag-row-${t.tag_id}">
+                    <td>${"　".repeat(depth(t))}${depth(t) ? "└ " : ""}${esc(t.name)}</td>
+                    <td>${t.aliases.map(esc).join("、")}</td><td>${t.video_count}</td>
+                    <td class="actions"><button class="small" onclick="editTag(${t.tag_id})">編集</button>
+                    <button class="small" onclick="deleteTag(${t.tag_id})">削除</button></td></tr>`).join("");
+                return `<h3>${esc(c)}</h3><table><tr><th>名前</th><th>別名</th><th>動画数</th><th></th></tr>${rows}</table>`;
+            }).join("");
+            const candidates = tagState.candidates.map(c => `<tr id="candidate-${c.candidate_id}">
+                <td><b>${esc(c.word)}</b></td><td>${esc(c.category || "")}</td><td>${esc(c.video_title || "")}</td>
+                <td class="actions"><button class="small primary" onclick="showAdopt(${c.candidate_id}, 'new')">新しいタグにする</button>
+                <button class="small" onclick="showAdopt(${c.candidate_id}, 'alias')">既存タグの別名にする</button>
+                <button class="small" onclick="rejectCandidate(${c.candidate_id})">却下</button>
+                <div id="adopt-${c.candidate_id}"></div></td></tr>`).join("");
+            app.innerHTML = `
+                ${message ? `<div class="notice">${esc(message)}</div>` : ""}
+                <div class="section">
+                    <h2>新タグ候補（タグ一覧に無い言葉）</h2>
+                    ${candidates ? `<table><tr><th>言葉</th><th>分類</th><th>動画</th><th></th></tr>${candidates}</table>`
+                                 : '<p class="muted">保留中の候補はありません</p>'}
+                    <p><button onclick="rematchAll()">全動画のタグを付け直す</button>
+                    <span class="muted">タグや別名を変えた後に押すと、これまでの動画にも反映されます（AIは使いません）</span></p>
+                </div>
+                <div class="section" id="tag-form-section">
+                    <h2 id="tag-form-title">タグを追加</h2>
+                    <div class="form-row">
+                        <div><label for="tag-name">名前</label><input type="text" id="tag-name"></div>
+                        <div><label for="tag-category">分類</label><select id="tag-category" onchange="refreshParentOptions()">${categoryOptions("作業")}</select></div>
+                        <div><label for="tag-parent">親（上位の分類）</label><select id="tag-parent"></select></div>
+                    </div>
+                    <label for="tag-aliases">別名（「|」や「、」で区切る）</label>
+                    <input type="text" id="tag-aliases" placeholder="例: 型枠の組立|建て込み">
+                    <p><button class="primary" id="tag-save" onclick="saveTag()">追加する</button>
+                    <button id="tag-cancel" style="display:none" onclick="renderTags()">編集をやめる</button></p>
+                    <input type="hidden" id="tag-id">
+                </div>
+                <div class="section"><h2>タグ一覧</h2>${tables}</div>`;
+            refreshParentOptions();
+        }
+
+        function refreshParentOptions(selectedId) {
+            const category = document.getElementById("tag-category").value;
+            const editingId = Number(document.getElementById("tag-id").value) || null;
+            document.getElementById("tag-parent").innerHTML =
+                tagOptions(t => t.category === category && t.tag_id !== editingId, selectedId, "（なし）");
+        }
+
+        function editTag(tagId) {
+            const t = tagState.byId[tagId];
+            document.getElementById("tag-id").value = tagId;
+            document.getElementById("tag-form-title").textContent = `タグを編集: ${t.name}`;
+            document.getElementById("tag-name").value = t.name;
+            document.getElementById("tag-category").value = t.category;
+            document.getElementById("tag-aliases").value = t.aliases.join("|");
+            refreshParentOptions(t.parent_id);
+            document.getElementById("tag-save").textContent = "保存する";
+            document.getElementById("tag-cancel").style.display = "inline-block";
+            document.getElementById("tag-form-section").scrollIntoView({ behavior: "smooth" });
+        }
+
+        async function saveTag() {
+            const tagId = document.getElementById("tag-id").value;
+            const parent = document.getElementById("tag-parent").value;
+            const body = JSON.stringify({
+                name: document.getElementById("tag-name").value,
+                category: document.getElementById("tag-category").value,
+                parent_id: parent ? Number(parent) : null,
+                aliases: parseAliases(document.getElementById("tag-aliases").value),
+            });
+            try {
+                await api(tagId ? `/skill/api/tags/${tagId}` : "/skill/api/tags", { method: tagId ? "PUT" : "POST", body });
+                renderTags(tagId ? "タグを保存しました" : "タグを追加しました");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        async function deleteTag(tagId) {
+            const t = tagState.byId[tagId];
+            if (!confirm(`「${t.name}」を削除しますか？（${t.video_count}本の動画から外れます）`)) return;
+            try {
+                await api(`/skill/api/tags/${tagId}`, { method: "DELETE" });
+                renderTags("タグを削除しました");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        function showAdopt(candidateId, mode) {
+            const c = tagState.candidates.find(c => c.candidate_id === candidateId);
+            const box = document.getElementById(`adopt-${candidateId}`);
+            if (mode === "new") {
+                const category = tagState.categories.includes(c.category) ? c.category : "作業";
+                box.innerHTML = `<div class="inline-form form-row">
+                    <div><label>名前</label><input type="text" id="adopt-name-${candidateId}" value="${esc(c.word)}"></div>
+                    <div><label>分類</label><select id="adopt-category-${candidateId}">${categoryOptions(category)}</select></div>
+                    <div><label>親</label><select id="adopt-parent-${candidateId}">${tagOptions(t => t.category === category, null, "（なし）")}</select></div>
+                    <div><button class="primary small" onclick="adopt(${candidateId}, 'new')">採用する</button></div></div>`;
+                document.getElementById(`adopt-category-${candidateId}`).addEventListener("change", e => {
+                    document.getElementById(`adopt-parent-${candidateId}`).innerHTML = tagOptions(t => t.category === e.target.value, null, "（なし）");
+                });
+            } else {
+                box.innerHTML = `<div class="inline-form form-row">
+                    <div><label>別名を追加するタグ</label><select id="adopt-tag-${candidateId}">${tagOptions(t => t.category !== "難易度", null, "選んでください")}</select></div>
+                    <div><button class="primary small" onclick="adopt(${candidateId}, 'alias')">別名にする</button></div></div>`;
+            }
+        }
+
+        async function adopt(candidateId, mode) {
+            const value = id => document.getElementById(`${id}-${candidateId}`).value;
+            const body = mode === "new"
+                ? { mode, name: value("adopt-name"), category: value("adopt-category"), parent_id: value("adopt-parent") ? Number(value("adopt-parent")) : null }
+                : { mode, tag_id: value("adopt-tag") ? Number(value("adopt-tag")) : null };
+            try {
+                await api(`/skill/api/tag_candidates/${candidateId}/adopt`, { method: "POST", body: JSON.stringify(body) });
+                renderTags("採用しました。「全動画のタグを付け直す」を押すと、これまでの動画にも反映されます");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        async function rejectCandidate(candidateId) {
+            try {
+                await api(`/skill/api/tag_candidates/${candidateId}/reject`, { method: "POST" });
+                renderTags("却下しました（同じ言葉は今後候補に出ません）");
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        async function rematchAll() {
+            try {
+                const res = await api("/skill/api/rematch", { method: "POST" });
+                renderTags(`${res.videos}本の動画のタグを付け直しました`);
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        // --- 再生 ---
+        async function renderVideo(videoId, params) {
+            app.innerHTML = `<div class="section muted">読み込み中...</div>`;
+            let video;
+            try {
+                video = await api(`/skill/api/videos/${videoId}`);
+            } catch (err) {
+                return showError(err);
+            }
+            if (video.status !== "done") {
+                app.innerHTML = `<div class="section" id="status-area">${renderStatus(video)}</div>`;
+                if (video.status !== "error") pollTimer = setTimeout(() => pollStatus(videoId), 3000);
+                return;
+            }
+
+            const tagsByStep = {};
+            for (const t of video.scene_tags) (tagsByStep[t.step_id] ||= []).push(t);
+            const list = (label, values, cls = "") =>
+                values && values.length ? `<div class="${cls}"><span class="label">${label}</span>${values.map(esc).join("、")}</div>` : "";
+            const stepCards = video.steps.map((s, i) => `
+                <div class="step-card" id="step-${s.step_id}" data-start="${s.start}" data-end="${s.end}">
+                    <div class="step-head" onclick="seekTo(${s.start})">
+                        <span class="time">${clock(s.start)}</span>
+                        <span class="title">手順${i + 1}　${esc(s.title)}</span>
+                        <span>▶</span>
+                    </div>
+                    <div class="step-body">
+                        <div>${esc(s.description)}</div>
+                        ${list("道具", s.tools)}${list("資材", s.materials)}
+                        ${list("注意点", s.cautions, "caution")}${list("コツ", s.tips, "tip")}
+                        <div class="chips" style="margin-top:6px">
+                            ${(tagsByStep[s.step_id] || []).map(t => `<span class="chip scene-tag" onclick="seekTo(${t.start})"><span class="cat">${esc(t.category)}</span>${esc(t.name)}</span>`).join("")}
+                        </div>
+                    </div>
+                </div>`).join("");
+            const marks = video.steps.map((s, i) => {
+                const left = s.start / video.duration * 100;
+                const width = Math.max((s.end - s.start) / video.duration * 100, 1);
+                return `<div class="mark" style="left:${left}%;width:${width}%" title="${esc(s.title)}" onclick="event.stopPropagation();seekTo(${s.start})">${i + 1}</div>`;
+            }).join("");
+            const transcript = video.segments.map(s =>
+                `<p onclick="seekTo(${s.start})"><span class="time">${clock(s.start)}</span>${esc(s.text)}</p>`).join("");
+
+            app.innerHTML = `
+                <div class="section">
+                    <h2>${esc(video.title)}</h2>
+                    <div class="muted">${video.explainer ? `説明者: ${esc(video.explainer)}　` : ""}長さ: ${clock(video.duration)}</div>
+                    <div class="chips" style="margin:6px 0">${video.video_tags.map(t => `<span class="chip"><span class="cat">${esc(t.category)}</span>${esc(t.name)}</span>`).join("")}</div>
+                    <div class="player-wrap">
+                        <video id="player" controls playsinline preload="metadata" src="${BASE_URL}/skill/api/videos/${videoId}/media">
+                            <track id="subtitles" kind="subtitles" srclang="ja" label="日本語" default src="${BASE_URL}/skill/api/videos/${videoId}/subtitles.vtt">
+                        </video>
+                        <div class="scene-bar" id="scene-bar" title="場面の印（タップでその場面へ）">${marks}<div class="playhead" id="playhead"></div></div>
+                    </div>
+                    <div class="player-tools">
+                        <button id="subtitle-toggle" onclick="toggleSubtitles()">字幕: 表示中</button>
+                        ${video.has_pdf ? `<a class="button primary" id="pdf-link" href="${BASE_URL}/skill/api/videos/${videoId}/procedure.pdf" download>📄 手順書PDF</a>` : ""}
+                    </div>
+                </div>
+                <div class="section">
+                    <h2>手順と場面（タップでその場面から再生）</h2>
+                    ${stepCards || '<p class="muted">手順がありません</p>'}
+                </div>
+                <div class="section transcript">
+                    <details><summary>文字起こし全文</summary>${transcript}</details>
+                </div>`;
+
+            const player = document.getElementById("player");
+            document.getElementById("scene-bar").addEventListener("click", e => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                seekTo((e.clientX - rect.left) / rect.width * video.duration);
+            });
+            player.addEventListener("timeupdate", () => {
+                document.getElementById("playhead").style.left = `${player.currentTime / video.duration * 100}%`;
+                for (const card of document.querySelectorAll(".step-card")) {
+                    const inStep = player.currentTime >= Number(card.dataset.start) && player.currentTime < Number(card.dataset.end);
+                    card.classList.toggle("current", inStep);
+                }
+            });
+            if (params.get("t")) seekTo(Number(params.get("t")));
+        }
+
+        function seekTo(seconds) {
+            const player = document.getElementById("player");
+            if (!player) return;
+            player.currentTime = seconds;
+            player.play().catch(() => { });  // 自動再生が止められても、位置の移動はできている
+            player.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+
+        function toggleSubtitles() {
+            const track = document.getElementById("player").textTracks[0];
+            const showing = track.mode === "showing";
+            track.mode = showing ? "hidden" : "showing";
+            document.getElementById("subtitle-toggle").textContent = showing ? "字幕: 非表示" : "字幕: 表示中";
+        }
+
+        route();
+    </script>
+</body>
+</html>
+'''
+
+
+# --- 13. サーバー起動（Googleドライブのマウント → Whisperの読み込み → ngrok → サーバー） ---
+from google.colab import drive
+drive.mount("/content/drive")
+os.makedirs(SKILL_MEDIA_DIR, exist_ok=True)
+
+import torch, whisper, openai, requests, nest_asyncio, uvicorn
+skill_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Whisper（{SKILL_WHISPER_MODEL}）を読み込み中...")
+skill_whisper_model = whisper.load_model(SKILL_WHISPER_MODEL, device=skill_device)
+skill_openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY")) if SKILL_LLM_PROVIDER == "openai" else None
+skill_app = build_skill_app(skill_whisper_model, skill_openai_client)
+
+!pkill -f uvicorn
+!pkill -f ngrok
+time.sleep(2)
+
+NGROK_AUTH_TOKEN = os.environ.get("NGROK_AUTH_TOKEN", "")
+!ngrok config add-authtoken {NGROK_AUTH_TOKEN}
+skill_ngrok_process = subprocess.Popen(["ngrok", "http", str(SKILL_PORT)], stdout=subprocess.PIPE)
+time.sleep(5)
+
+try:
+    public_url = requests.get("http://localhost:4040/api/tunnels").json()["tunnels"][0]["public_url"]
+    print("\n✅ 接続成功！")
+    print(f"📱 スマホで開くURL: {public_url}/skill")
+    print("↑ 初回だけ『Visit Site』を押してください。")
+except Exception as e:
+    print(f"\n❌ URL取得失敗: {e}")
+
+nest_asyncio.apply()
+skill_config = uvicorn.Config(skill_app, host="0.0.0.0", port=SKILL_PORT, loop="asyncio")
+skill_server = uvicorn.Server(skill_config)
+await skill_server.serve()
