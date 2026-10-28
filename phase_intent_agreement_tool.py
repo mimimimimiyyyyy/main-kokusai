@@ -15,6 +15,7 @@
 # 変更した場合は両方に反映すること。
 
 import csv
+import json
 import random
 import sqlite3
 from datetime import datetime
@@ -220,6 +221,68 @@ def _kappa_label(kappa):
     return "一致以下（偶然より悪い）"
 
 
+def get_retag_consistency(session_id: int, method_version: str):
+    """
+    人手ラベルを用意しなくても自動で測れる、GPT-4oの自己一貫性(test-retest
+    reliability)チェック。サーバーの POST /corpus/{session_id}/retag を
+    実行して同じ発話にもう一度タグ付けさせ(addin_resultsに保存される)、
+    その結果と1回目のタグ付け(turnsテーブル)をCohen's kappaで比較する。
+
+    注意: これは「正解と合っているか」ではなく「同じモデルが毎回同じ判断を
+    するか」を測るものに過ぎない。一致率が低ければ「このタスクは判断が
+    曖昧・不安定」という警告になるが、一致率が高くても両方とも間違っている
+    可能性は否定できない(本当の正解率を知りたい場合は人手ラベルが必要)。
+
+    事前にColab外(curl等)かrequestsで下記を実行し、method_versionを
+    控えておくこと:
+        POST {ngrok_url}/corpus/{session_id}/retag
+        -> レスポンスの "method_version" を引数に渡す
+    """
+    conn = get_connection()
+    original = conn.execute(
+        "SELECT id, start, phase, intent FROM turns WHERE session_id=? ORDER BY start",
+        (session_id,)
+    ).fetchall()
+    retag_row = conn.execute(
+        """SELECT result FROM addin_results
+           WHERE session_id=? AND addin_name='phase_intent_tagging' AND method_version=?""",
+        (session_id, method_version)
+    ).fetchone()
+    conn.close()
+
+    if not retag_row:
+        print(f"method_version={method_version} の再タグ付け結果が見つかりません。"
+              f"先に POST /corpus/{session_id}/retag を実行してください。")
+        return None
+
+    retagged_turns = json.loads(retag_row[0])["turns"]
+    if len(original) != len(retagged_turns):
+        print(f"件数が一致しません(turns={len(original)}件, retag結果={len(retagged_turns)}件)。"
+              "turnsが変化した後の再タグ付けの可能性があるため比較できません。")
+        return None
+
+    labels_a_phase = [t[2] for t in original]
+    labels_b_phase = [t["phase"] for t in retagged_turns]
+    labels_a_intent = [t[3] for t in original]
+    labels_b_intent = [t["intent"] for t in retagged_turns]
+
+    n = len(original)
+    phase_kappa = cohens_kappa(labels_a_phase, labels_b_phase)
+    intent_kappa = cohens_kappa(labels_a_intent, labels_b_intent)
+    phase_agree = sum(1 for a, b in zip(labels_a_phase, labels_b_phase) if a == b) / n
+    intent_agree = sum(1 for a, b in zip(labels_a_intent, labels_b_intent) if a == b) / n
+
+    print(f"=== セッション{session_id} GPT-4o自己一貫性（1回目タグ付け vs retag） ===")
+    print(f"（n={n}発話、1回目と{method_version}の2回のタグ付け結果を比較）\n")
+    print(f"phase : 一致率={phase_agree:.1%}, Cohen's kappa={phase_kappa:.3f} ({_kappa_label(phase_kappa)})")
+    print(f"intent: 一致率={intent_agree:.1%}, Cohen's kappa={intent_kappa:.3f} ({_kappa_label(intent_kappa)})")
+    return {
+        "n": n,
+        "phase": {"percent_agreement": round(phase_agree, 3), "cohens_kappa": round(phase_kappa, 3)},
+        "intent": {"percent_agreement": round(intent_agree, 3), "cohens_kappa": round(intent_kappa, 3)},
+    }
+
+
 def print_agreement_report(session_id: int):
     data = get_agreement(session_id)
     if not data["pairwise_agreement"]:
@@ -256,3 +319,17 @@ def print_agreement_report(session_id: int):
 
 # 4. GPT-4oと人手ラベルの一致率・Cohen's kappaを表示する
 # print_agreement_report(session_id=_latest_session_id)
+
+# --- 人手を使わない自動チェック: GPT-4oの自己一貫性 ---
+#
+# 5. まずColab外(ブラウザ等)かrequestsで、対象セッションの再タグ付けを実行する
+#    （ngrok_urlはColabに表示されている公開URLに置き換える）
+# import requests
+# retag_res = requests.post(f"{ngrok_url}/corpus/{_latest_session_id}/retag").json()
+# print(retag_res)  # {"status": "saved", ..., "method_version": "..."} のmethod_versionを控える
+
+# 6. 1回目のタグ付け結果とretag結果の一致率・Cohen's kappaを表示する
+#    （人手ラベルは一切不要。ただし「正解と合っているか」ではなく
+#    「GPT-4oが毎回同じ判断をするか」を測るものである点に注意）
+# get_retag_consistency(session_id=_latest_session_id, method_version="（5.で控えたmethod_version）")
+
