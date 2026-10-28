@@ -2,20 +2,13 @@
 # audio_analysis_pipeline.py のサーバーを起動していなくても、Google Driveがマウントされて
 # いればこのセル単体で動く（transcription_accuracy_tool.py と同じ考え方）。
 #
-# 流れ（全件を人手で確認する場合）:
+# 流れ:
 #   1. export_annotation_template() で、対象セッションの発話をランダムサンプリングし、
 #      phase/intent列が空のCSVテンプレートをGoogle Driveに保存する
 #   2. そのCSVをGoogleスプレッドシート等で開き、phase/intent列を手で埋める
 #      （有効な値はコンソールに表示されるPHASE_ORDER/INTENT_LABELSの中から選ぶ）
 #   3. import_annotations_from_csv() で、埋めたCSVをhuman_annotationsテーブルに保存する
 #   4. print_agreement_report() で、GPT-4oのタグと人手ラベルの一致率・Cohen's kappaを表示する
-#
-# 流れ（GPT-4oの自己申告信頼度が低い発話だけ確認する場合。全件確認するより手間が少ない）:
-#   1'. export_low_confidence_turns() で、phase_confidence/intent_confidenceが
-#       閾値未満の発話だけをCSVに出力する（GPT-4oの予測・信頼度も一緒に載せる）
-#   2'. そのCSVのcorrected_phase/corrected_intent列を人手で埋める
-#   3'. import_low_confidence_corrections() で読み込んでhuman_annotationsに保存する
-#   4'. print_agreement_report() で一致率を表示する（低信頼度の発話だけが対象になる）
 #
 # PHASE_ORDER/INTENT_LABELSとCohen's kappaの計算ロジックは、サーバー側
 # （audio_analysis_pipeline.py）と同じものをここに複製している。ロジックを
@@ -109,112 +102,6 @@ def export_annotation_template(session_id: int, n: int = 30, seed: int = 42, sav
     print("\nこのCSVをGoogleスプレッドシート等で開き、phase/intent列を埋めてから")
     print("import_annotations_from_csv() で読み込んでください。")
     return template_path
-
-
-def export_low_confidence_turns(session_id: int, phase_threshold: float = 0.6,
-                                 intent_threshold: float = 0.6, save_dir: str = SAVE_DIR):
-    """
-    全発話を人手確認するのは大変なので、GPT-4oが自己申告した信頼度スコア
-    (phase_confidence/intent_confidence、audio_analysis_pipeline.pyの
-    tag_turns_with_gptが付与する)がいずれかの閾値を下回る発話だけを抽出し、
-    CSVに出力する。GPT-4oの予測と信頼度も一緒に載せるので、それを見ながら
-    corrected_phase/corrected_intent列に人手で正しい値を入れていく想定。
-
-    注意: phase_confidence/intent_confidence列は、信頼度スコア機能を追加した
-    以降にアップロード（または/retag）したセッションにしか入っていない。
-    それより前のセッションはNULLになり、この関数では対象外（0件）になる。
-    """
-    conn = get_connection()
-    rows = conn.execute(
-        """SELECT id, speaker, start, text, phase, intent, phase_confidence, intent_confidence
-           FROM turns WHERE session_id=? ORDER BY start""",
-        (session_id,)
-    ).fetchall()
-    conn.close()
-    if not rows:
-        print(f"session_id={session_id} のturnsが見つかりません。")
-        return None
-
-    low_confidence = [
-        r for r in rows
-        if (r[6] is not None and r[6] < phase_threshold)
-        or (r[7] is not None and r[7] < intent_threshold)
-    ]
-    if not low_confidence:
-        print(
-            f"信頼度が閾値(phase<{phase_threshold}, intent<{intent_threshold})を下回る発話は"
-            f"ありませんでした（全{len(rows)}件中）。"
-        )
-        return None
-
-    template_path = f"{save_dir}/session_{session_id}_low_confidence_review.csv"
-    with open(template_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "turn_id", "speaker", "start", "text",
-            "ai_phase", "ai_intent", "phase_confidence", "intent_confidence",
-            "corrected_phase", "corrected_intent"
-        ])
-        for turn_id, speaker, start, text, phase, intent, phase_conf, intent_conf in low_confidence:
-            writer.writerow([turn_id, speaker, start, text, phase, intent, phase_conf, intent_conf, "", ""])
-
-    print(
-        f"信頼度が低い発話を保存しました: {template_path}"
-        f"（{len(low_confidence)}件 / 全{len(rows)}件中）"
-    )
-    print(f"\ncorrected_phase列に入力できる値: {', '.join(PHASE_ORDER)}")
-    print(f"corrected_intent列に入力できる値: {', '.join(INTENT_LABELS)}")
-    print("\nこのCSVを開いてcorrected_phase/corrected_intent列を埋めたら、")
-    print("import_low_confidence_corrections() で読み込んでください。")
-    return template_path
-
-
-def import_low_confidence_corrections(session_id: int, csv_path: str, annotator_id: str):
-    """
-    export_low_confidence_turns() で作ったCSV（corrected_phase/corrected_intent
-    列を埋めたもの）を読み込み、human_annotationsテーブルに保存する。
-    import_annotations_from_csv()とほぼ同じだが、列名がcorrected_phase/
-    corrected_intentである点だけが違う。
-    """
-    conn = get_connection()
-    valid_turn_ids = {
-        row[0] for row in conn.execute(
-            "SELECT id FROM turns WHERE session_id=?", (session_id,)
-        ).fetchall()
-    }
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    saved = 0
-    skipped = []
-    with open(csv_path, encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            turn_id = int(row["turn_id"])
-            phase = row.get("corrected_phase", "").strip()
-            intent = row.get("corrected_intent", "").strip()
-            if turn_id not in valid_turn_ids:
-                skipped.append((turn_id, "turn_idが存在しない"))
-                continue
-            if phase not in PHASE_ORDER or intent not in INTENT_LABELS:
-                skipped.append((turn_id, f"未入力または不正な値(phase={phase!r}, intent={intent!r})"))
-                continue
-            conn.execute(
-                """INSERT INTO human_annotations (turn_id, annotator_id, phase, intent, created)
-                   VALUES (?,?,?,?,?)
-                   ON CONFLICT(turn_id, annotator_id) DO UPDATE SET
-                       phase=excluded.phase, intent=excluded.intent, created=excluded.created""",
-                (turn_id, annotator_id, phase, intent, now)
-            )
-            saved += 1
-    conn.commit()
-    conn.close()
-
-    print(f"{saved}件を保存しました（annotator_id={annotator_id}）。")
-    if skipped:
-        print(f"{len(skipped)}件をスキップしました:")
-        for turn_id, reason in skipped:
-            print(f"  turn_id={turn_id}: {reason}")
-    return {"saved": saved, "skipped": skipped}
 
 
 def import_annotations_from_csv(session_id: int, csv_path: str, annotator_id: str):
@@ -445,22 +332,4 @@ def print_agreement_report(session_id: int):
 #    （人手ラベルは一切不要。ただし「正解と合っているか」ではなく
 #    「GPT-4oが毎回同じ判断をするか」を測るものである点に注意）
 # get_retag_consistency(session_id=_latest_session_id, method_version="（5.で控えたmethod_version）")
-
-# --- 信頼度が低い発話だけを人手確認する(全件確認より手間が少ない) ---
-#
-# 7. GPT-4oの自己申告信頼度が低い発話だけをCSVに出力する
-#    （信頼度スコア機能の追加後にアップロード/retagしたセッションが対象）
-# export_low_confidence_turns(session_id=_latest_session_id, phase_threshold=0.6, intent_threshold=0.6)
-
-# 8. 出力されたCSVのcorrected_phase/corrected_intent列を人手で埋める
-
-# 9. 埋めたCSVを読み込んで保存する
-# import_low_confidence_corrections(
-#     session_id=_latest_session_id,
-#     csv_path="/content/drive/MyDrive/session_X_low_confidence_review.csv",
-#     annotator_id="researcher_A"
-# )
-
-# 10. 一致率を表示する（低信頼度の発話だけが対象になる）
-# print_agreement_report(session_id=_latest_session_id)
 
