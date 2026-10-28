@@ -74,39 +74,88 @@ def cohens_kappa(labels_a, labels_b):
     return (po - pe) / (1 - pe)
 
 
-def export_annotation_template(session_id: int, n: int = 30, seed: int = 42, save_dir: str = SAVE_DIR):
+def _sample_turns_with_context(session_id, n, seed, min_chars):
+    """
+    対象セッションの発話を取得し、min_chars文字未満の短すぎる発話
+    （相槌の断片など、それだけでは意図・フェーズを判断しづらいもの）を
+    候補から除外したうえでn件をランダムサンプリングする。
+    戻り値: (サンプル[(turn_id, speaker, start, text), ...], 全発話の順序付きID,
+             turn_id -> (turn_id, speaker, start, text) の辞書)
+    GPT-4o自身は実際にはブロック単位(前後の発話も含む)で判断しているため、
+    文脈表示用に全発話も一緒に返す。
+    """
+    conn = get_connection()
+    all_turns = conn.execute(
+        "SELECT id, speaker, start, text FROM turns WHERE session_id=? ORDER BY start",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+    if not all_turns:
+        return None, None, None
+
+    ordered_ids = [t[0] for t in all_turns]
+    turns_by_id = {t[0]: t for t in all_turns}
+
+    candidates = [t for t in all_turns if len(t[3]) >= min_chars]
+    if not candidates:
+        return [], ordered_ids, turns_by_id
+
+    rng = random.Random(seed)
+    sample = candidates if len(candidates) <= n else rng.sample(candidates, n)
+    sample = sorted(sample, key=lambda t: t[2])
+    return sample, ordered_ids, turns_by_id
+
+
+def _context_window(turn_id, ordered_ids, turns_by_id, context_size):
+    """turn_idの前後context_size件ずつの発話を(speaker, text, is_target)のリストで返す。"""
+    pos = ordered_ids.index(turn_id)
+    window_start = max(0, pos - context_size)
+    window_end = min(len(ordered_ids), pos + context_size + 1)
+    return [
+        (turns_by_id[wid][1], turns_by_id[wid][3], wid == turn_id)
+        for wid in ordered_ids[window_start:window_end]
+    ]
+
+
+def export_annotation_template(session_id: int, n: int = 30, seed: int = 42, save_dir: str = SAVE_DIR,
+                                min_chars: int = 8, context_size: int = 2):
     """
     対象セッションの発話からn件をランダムサンプリングし、phase/intent列が空の
     CSVテンプレートを保存する。人手ラベル付けを特定の時間帯や話者に偏らせない
     ため、全発話から一様ランダムに選ぶ（GPT-4oの予測は見せない＝先入観を避ける
     ため、CSVにはAIタグを含めていない）。
+
+    "is"のような1語だけの発話は、それだけでは意図・フェーズを判断しづらいため、
+    min_chars文字未満の発話はサンプリング候補から除外する。また、GPT-4o自身は
+    実際にはブロック単位(前後の発話も含む)で判断しているため、前後
+    context_size件ずつの発話をcontext列にまとめて載せ、人手でも同じように
+    文脈込みで判断できるようにする（ラベル付けの対象はtext列の発話のみ）。
     """
-    conn = get_connection()
-    turns = conn.execute(
-        "SELECT id, speaker, start, text FROM turns WHERE session_id=? ORDER BY start",
-        (session_id,)
-    ).fetchall()
-    conn.close()
-    if not turns:
+    sample, ordered_ids, turns_by_id = _sample_turns_with_context(session_id, n, seed, min_chars)
+    if sample is None:
         print(f"session_id={session_id} のturnsが見つかりません。")
         return None
-
-    rng = random.Random(seed)
-    sample = turns if len(turns) <= n else rng.sample(turns, n)
-    sample = sorted(sample, key=lambda t: t[2])  # 時系列順に並べ直す
+    if not sample:
+        print(f"min_chars={min_chars}文字以上の発話がありません。min_charsを下げてください。")
+        return None
 
     template_path = f"{save_dir}/session_{session_id}_annotation_template.csv"
     with open(template_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["turn_id", "speaker", "start", "text", "phase", "intent"])
+        writer.writerow(["turn_id", "speaker", "start", "text", "context", "phase", "intent"])
         for turn_id, speaker, start, text in sample:
-            writer.writerow([turn_id, speaker, start, text, "", ""])
+            window = _context_window(turn_id, ordered_ids, turns_by_id, context_size)
+            context = " / ".join(
+                f"{'[対象]' if is_target else ''}{w_speaker}: {w_text}"
+                for w_speaker, w_text, is_target in window
+            )
+            writer.writerow([turn_id, speaker, start, text, context, "", ""])
 
-    print(f"テンプレートを保存しました: {template_path}（{len(sample)}件）")
+    print(f"テンプレートを保存しました: {template_path}（{len(sample)}件、{min_chars}文字未満の発話は除外済み）")
     print(f"\nphase列に入力できる値: {', '.join(PHASE_ORDER)}")
     print(f"intent列に入力できる値: {', '.join(INTENT_LABELS)}")
-    print("\nこのCSVをGoogleスプレッドシート等で開き、phase/intent列を埋めてから")
-    print("import_annotations_from_csv() で読み込んでください。")
+    print("\nこのCSVをGoogleスプレッドシート等で開き、context列（前後の発話）も参考にしながら")
+    print("phase/intent列を埋めてから import_annotations_from_csv() で読み込んでください。")
     return template_path
 
 
@@ -118,44 +167,50 @@ def _prompt_choice(options):
         print(f"1〜{len(options)}の数字を入力してください。")
 
 
-def interactive_annotate(session_id: int, n: int = 15, seed: int = 42, annotator_id: str = "me"):
+def interactive_annotate(session_id: int, n: int = 15, seed: int = 42, annotator_id: str = "me",
+                          min_chars: int = 8, context_size: int = 2):
     """
     CSV・スプレッドシートを経由せず、Colabのセル内でinput()を使って直接
     人手ラベル付けができる簡易版。発話のテキストを1件ずつ表示し、phase/intent
     を番号で選んでもらう（数字を入力してEnterを押すだけ）。ダウンロード・
     再アップロードの手間を省きたい場合はこちらを使う。
 
+    "is"のような1語だけの発話は、それだけでは意図・フェーズを判断しづらいため、
+    min_chars文字未満の発話はサンプリング候補から除外する。また、GPT-4o自身は
+    実際にはブロック単位(前後の発話も含む)で判断しているため、前後
+    context_size件ずつの発話も文脈として一緒に表示する（ラベル付けの対象は
+    【対象】と表示された発話のみ）。
+
     途中でCtrl+C（中断）しても、それまでに答えた分は保存される。
     """
-    conn = get_connection()
-    turns = conn.execute(
-        "SELECT id, speaker, start, text FROM turns WHERE session_id=? ORDER BY start",
-        (session_id,)
-    ).fetchall()
-    conn.close()
-    if not turns:
+    sample, ordered_ids, turns_by_id = _sample_turns_with_context(session_id, n, seed, min_chars)
+    if sample is None:
         print(f"session_id={session_id} のturnsが見つかりません。")
         return None
+    if not sample:
+        print(f"min_chars={min_chars}文字以上の発話がありません。min_charsを下げてください。")
+        return None
 
-    rng = random.Random(seed)
-    sample = turns if len(turns) <= n else rng.sample(turns, n)
-    sample = sorted(sample, key=lambda t: t[2])
-
-    print(f"{len(sample)}件の発話にラベルを付けます。各質問で番号を入力してEnterを押してください。")
-    print("途中でやめたい場合はCtrl+Cで中断できます（それまでに答えた分は保存されます）。")
+    print(f"{len(sample)}件の発話にラベルを付けます（{min_chars}文字未満の短い発話は除外済み）。")
+    print("前後の発話も文脈として表示します（ラベル付けの対象は【対象】の行だけです）。")
+    print("各質問で番号を入力してEnterを押してください。Ctrl+Cで中断してもそれまでの回答は保存されます。")
 
     annotations = []
     try:
         for idx, (turn_id, speaker, start, text) in enumerate(sample, 1):
-            print(f"\n--- [{idx}/{len(sample)}] turn_id={turn_id} ({speaker}, {start:.1f}秒) ---")
-            print(f"発話内容: {text}")
+            window = _context_window(turn_id, ordered_ids, turns_by_id, context_size)
 
-            print("\nフェーズを選んでください:")
+            print(f"\n--- [{idx}/{len(sample)}] turn_id={turn_id} ({start:.1f}秒) ---")
+            for w_speaker, w_text, is_target in window:
+                marker = "【対象】" if is_target else "　　　"
+                print(f"{marker} {w_speaker}: {w_text}")
+
+            print("\nフェーズを選んでください（【対象】の発話について）:")
             for i, label in enumerate(PHASE_ORDER, 1):
                 print(f"  {i}. {label}")
             phase = _prompt_choice(PHASE_ORDER)
 
-            print("\n意図を選んでください:")
+            print("\n意図を選んでください（【対象】の発話について）:")
             for i, label in enumerate(INTENT_LABELS, 1):
                 print(f"  {i}. {label}")
             intent = _prompt_choice(INTENT_LABELS)
