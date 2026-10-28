@@ -109,19 +109,29 @@ def init_db():
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS turns (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER,
-            speaker    TEXT,
-            start      REAL,
-            end        REAL,
-            text       TEXT,
-            phase      TEXT,
-            intent     TEXT,
-            role       TEXT,
-            embedding  BLOB,
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       INTEGER,
+            speaker          TEXT,
+            start            REAL,
+            end              REAL,
+            text             TEXT,
+            phase            TEXT,
+            intent           TEXT,
+            role             TEXT,
+            embedding        BLOB,
+            phase_confidence  REAL,
+            intent_confidence REAL,
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         )
     """)
+    # 既存のDB(Google Drive上のcorpus.db)はCREATE TABLE IF NOT EXISTSでは更新されない
+    # ため、信頼度スコアを後から追加した場合に備えてALTER TABLEで移行する。
+    # 列が既に存在する場合はエラーになるので無視する。
+    for column in ("phase_confidence", "intent_confidence"):
+        try:
+            conn.execute(f"ALTER TABLE turns ADD COLUMN {column} REAL")
+        except sqlite3.OperationalError:
+            pass
     # addin_results: 新しい分析手法の結果をセッションに紐づけて何度でも追加できる置き場。
     # method_version を分けることで、同じ addin_name でも手法を変えて再分析した結果を
     # 上書きせずに全部残し、後から比較・再利用できるようにする。
@@ -221,8 +231,9 @@ def save_to_corpus(filename, result, all_turns, embeddings):
     for i, turn in enumerate(all_turns):
         conn.execute(
             """INSERT INTO turns
-               (session_id, speaker, start, end, text, phase, intent, role, embedding)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               (session_id, speaker, start, end, text, phase, intent, role, embedding,
+                phase_confidence, intent_confidence)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 session_id,
                 turn['speaker'], turn['start'], turn['end'],
@@ -230,11 +241,26 @@ def save_to_corpus(filename, result, all_turns, embeddings):
                 turn.get('phase', 'Information Sharing'),
                 turn.get('intent', 'Explanation'),
                 turn.get('role', 'Participant'),
-                embeddings[i].astype(np.float64).tobytes()
+                embeddings[i].astype(np.float64).tobytes(),
+                turn.get('phase_confidence'),
+                turn.get('intent_confidence')
             )
         )
     conn.commit()
     return session_id
+
+
+def _clamp_confidence(value):
+    """
+    GPT-4oが返した信頼度スコアを0.0〜1.0のfloatに正規化する。数値でない・
+    範囲外などの不正な値はNone(不明)として扱い、呼び出し側でフィルタ対象から
+    除外できるようにする。
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, value))
 
 
 def tag_turns_with_gpt(turns, roles_dict, block_size=40):
@@ -279,7 +305,14 @@ CRITICAL RULES:
 Data (utterances {i} to {i + len(block) - 1} of {len(tagged)} total):
 {json.dumps(block, ensure_ascii=False)}
 
-Return JSON with key 'analysis' containing a list of {{"phase": ..., "intent": ...}} for each utterance in order.
+For each utterance, also give a confidence score (0.0〜1.0) for how certain you are
+about each label. Use a LOW score when the utterance is short/ambiguous/could
+plausibly fit more than one label; use a HIGH score only when the label is clearly
+correct given the content.
+
+Return JSON with key 'analysis' containing a list of
+{{"phase": ..., "intent": ..., "phase_confidence": 0.0-1.0, "intent_confidence": 0.0-1.0}}
+for each utterance in order.
         """
         tag_res = client.chat.completions.create(
             model="gpt-4o",
@@ -292,6 +325,8 @@ Return JSON with key 'analysis' containing a list of {{"phase": ..., "intent": .
                 turn = tagged[i + j]
                 turn["phase"] = normalize_phase(tag.get('phase', 'Information Sharing'))
                 turn["intent"] = normalize_intent(tag.get('intent', 'Explanation'))
+                turn["phase_confidence"] = _clamp_confidence(tag.get('phase_confidence'))
+                turn["intent_confidence"] = _clamp_confidence(tag.get('intent_confidence'))
                 turn["role"] = roles_dict.get(turn['speaker'], "Participant")
     return tagged
 
@@ -709,6 +744,8 @@ def run_full_analysis(video_path):
         turn.setdefault('phase', 'Information Sharing')
         turn.setdefault('intent', 'Explanation')
         turn.setdefault('role', roles_dict.get(turn['speaker'], 'Participant'))
+        turn.setdefault('phase_confidence', None)
+        turn.setdefault('intent_confidence', None)
 
     # D. 全編タグ付け（既存turnsの再タグ付けとロジックを共有）
     print("AIによる全編タグ付け中...")
@@ -897,7 +934,9 @@ async def api_corpus_get(session_id: int):
     if not session:
         return {"error": "Session not found"}
     turns = conn.execute(
-        "SELECT speaker, start, end, text, phase, intent, role FROM turns WHERE session_id=? ORDER BY start",
+        """SELECT speaker, start, end, text, phase, intent, role,
+                  phase_confidence, intent_confidence
+           FROM turns WHERE session_id=? ORDER BY start""",
         (session_id,)
     ).fetchall()
     addins = conn.execute(
@@ -914,7 +953,8 @@ async def api_corpus_get(session_id: int):
         "turns": [
             {
                 "speaker": t[0], "start": t[1], "end": t[2],
-                "text": t[3], "phase": t[4], "intent": t[5], "role": t[6]
+                "text": t[3], "phase": t[4], "intent": t[5], "role": t[6],
+                "phase_confidence": t[7], "intent_confidence": t[8]
             }
             for t in turns
         ],
