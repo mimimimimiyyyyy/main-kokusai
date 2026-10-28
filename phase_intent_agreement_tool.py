@@ -2,13 +2,19 @@
 # audio_analysis_pipeline.py のサーバーを起動していなくても、Google Driveがマウントされて
 # いればこのセル単体で動く（transcription_accuracy_tool.py と同じ考え方）。
 #
-# 流れ:
-#   1. export_annotation_template() で、対象セッションの発話をランダムサンプリングし、
-#      phase/intent列が空のCSVテンプレートをGoogle Driveに保存する
-#   2. そのCSVをGoogleスプレッドシート等で開き、phase/intent列を手で埋める
-#      （有効な値はコンソールに表示されるPHASE_ORDER/INTENT_LABELSの中から選ぶ）
-#   3. import_annotations_from_csv() で、埋めたCSVをhuman_annotationsテーブルに保存する
-#   4. print_agreement_report() で、GPT-4oのタグと人手ラベルの一致率・Cohen's kappaを表示する
+# 手軽な流れ（おすすめ・CSV不要）:
+#   1. interactive_annotate() を実行すると、発話テキストが1件ずつ表示され、
+#      番号を入力してEnterを押すだけでphase/intentを選べる
+#      （Ctrl+Cで中断しても、それまでの回答は保存される）
+#   2. print_agreement_report() で、GPT-4oのタグと人手ラベルの一致率・Cohen's kappaを表示する
+#
+# CSV経由の流れ（スプレッドシートで編集したい場合）:
+#   1'. export_annotation_template() で、対象セッションの発話をランダムサンプリングし、
+#       phase/intent列が空のCSVテンプレートをGoogle Driveに保存する
+#   2'. そのCSVをGoogleスプレッドシート等で開き、phase/intent列を手で埋める
+#       （有効な値はコンソールに表示されるPHASE_ORDER/INTENT_LABELSの中から選ぶ）
+#   3'. import_annotations_from_csv() で、埋めたCSVをhuman_annotationsテーブルに保存する
+#   4'. print_agreement_report() で一致率を表示する
 #
 # PHASE_ORDER/INTENT_LABELSとCohen's kappaの計算ロジックは、サーバー側
 # （audio_analysis_pipeline.py）と同じものをここに複製している。ロジックを
@@ -102,6 +108,81 @@ def export_annotation_template(session_id: int, n: int = 30, seed: int = 42, sav
     print("\nこのCSVをGoogleスプレッドシート等で開き、phase/intent列を埋めてから")
     print("import_annotations_from_csv() で読み込んでください。")
     return template_path
+
+
+def _prompt_choice(options):
+    while True:
+        raw = input(f"番号(1-{len(options)}): ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1]
+        print(f"1〜{len(options)}の数字を入力してください。")
+
+
+def interactive_annotate(session_id: int, n: int = 15, seed: int = 42, annotator_id: str = "me"):
+    """
+    CSV・スプレッドシートを経由せず、Colabのセル内でinput()を使って直接
+    人手ラベル付けができる簡易版。発話のテキストを1件ずつ表示し、phase/intent
+    を番号で選んでもらう（数字を入力してEnterを押すだけ）。ダウンロード・
+    再アップロードの手間を省きたい場合はこちらを使う。
+
+    途中でCtrl+C（中断）しても、それまでに答えた分は保存される。
+    """
+    conn = get_connection()
+    turns = conn.execute(
+        "SELECT id, speaker, start, text FROM turns WHERE session_id=? ORDER BY start",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+    if not turns:
+        print(f"session_id={session_id} のturnsが見つかりません。")
+        return None
+
+    rng = random.Random(seed)
+    sample = turns if len(turns) <= n else rng.sample(turns, n)
+    sample = sorted(sample, key=lambda t: t[2])
+
+    print(f"{len(sample)}件の発話にラベルを付けます。各質問で番号を入力してEnterを押してください。")
+    print("途中でやめたい場合はCtrl+Cで中断できます（それまでに答えた分は保存されます）。")
+
+    annotations = []
+    try:
+        for idx, (turn_id, speaker, start, text) in enumerate(sample, 1):
+            print(f"\n--- [{idx}/{len(sample)}] turn_id={turn_id} ({speaker}, {start:.1f}秒) ---")
+            print(f"発話内容: {text}")
+
+            print("\nフェーズを選んでください:")
+            for i, label in enumerate(PHASE_ORDER, 1):
+                print(f"  {i}. {label}")
+            phase = _prompt_choice(PHASE_ORDER)
+
+            print("\n意図を選んでください:")
+            for i, label in enumerate(INTENT_LABELS, 1):
+                print(f"  {i}. {label}")
+            intent = _prompt_choice(INTENT_LABELS)
+
+            annotations.append({"turn_id": turn_id, "phase": phase, "intent": intent})
+    except KeyboardInterrupt:
+        print(f"\n中断しました。ここまでの{len(annotations)}件を保存します。")
+
+    if not annotations:
+        print("保存するラベルがありません。")
+        return None
+
+    conn = get_connection()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for a in annotations:
+        conn.execute(
+            """INSERT INTO human_annotations (turn_id, annotator_id, phase, intent, created)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(turn_id, annotator_id) DO UPDATE SET
+                   phase=excluded.phase, intent=excluded.intent, created=excluded.created""",
+            (a["turn_id"], annotator_id, a["phase"], a["intent"], now)
+        )
+    conn.commit()
+    conn.close()
+
+    print(f"\n{len(annotations)}件のラベルを保存しました（annotator_id={annotator_id}）。")
+    return annotations
 
 
 def import_annotations_from_csv(session_id: int, csv_path: str, annotator_id: str):
@@ -301,23 +382,37 @@ def print_agreement_report(session_id: int):
 
 # --- 使い方の例（実行する場合はコメントを外す） ---
 
-# 1. 最新セッションから30件をランダムサンプリングしてCSVテンプレートを出力する
+# --- 手軽な流れ(おすすめ・CSV不要) ---
+#
+# 1. 最新セッションを対象に、Colab上で直接ラベル付けする
+#    （テキストが1件ずつ表示され、番号を入力してEnterを押すだけ）
+# _conn = sqlite3.connect(DB_PATH)
+# _latest_session_id = _conn.execute("SELECT id FROM sessions ORDER BY id DESC LIMIT 1").fetchone()[0]
+# _conn.close()
+# interactive_annotate(session_id=_latest_session_id, n=15, annotator_id="researcher_A")
+
+# 2. GPT-4oと人手ラベルの一致率・Cohen's kappaを表示する
+# print_agreement_report(session_id=_latest_session_id)
+
+# --- CSV経由の流れ(スプレッドシートで編集したい場合) ---
+#
+# 1'. 最新セッションから30件をランダムサンプリングしてCSVテンプレートを出力する
 # _conn = sqlite3.connect(DB_PATH)
 # _latest_session_id = _conn.execute("SELECT id FROM sessions ORDER BY id DESC LIMIT 1").fetchone()[0]
 # _conn.close()
 # export_annotation_template(session_id=_latest_session_id, n=30)
 
-# 2. 出力されたCSVをGoogleスプレッドシート等で開き、phase/intent列を手で埋める
+# 2'. 出力されたCSVをGoogleスプレッドシート等で開き、phase/intent列を手で埋める
 #    （有効な値は上記の出力に表示される）
 
-# 3. 埋めたCSVを読み込んで保存する（annotator_idは自分の名前など）
+# 3'. 埋めたCSVを読み込んで保存する（annotator_idは自分の名前など）
 # import_annotations_from_csv(
 #     session_id=_latest_session_id,
 #     csv_path="/content/drive/MyDrive/session_X_annotation_template.csv",
 #     annotator_id="researcher_A"
 # )
 
-# 4. GPT-4oと人手ラベルの一致率・Cohen's kappaを表示する
+# 4'. GPT-4oと人手ラベルの一致率・Cohen's kappaを表示する
 # print_agreement_report(session_id=_latest_session_id)
 
 # --- 人手を使わない自動チェック: GPT-4oの自己一貫性 ---
