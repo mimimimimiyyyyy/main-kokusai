@@ -377,6 +377,86 @@ def get_agreement(session_id: int):
     return {"session_id": session_id, "raters": rater_ids, "pairwise_agreement": pairwise_agreement}
 
 
+def get_agreement_for_retag(session_id: int, method_version: str, label: str = None):
+    """
+    get_agreement()はturnsテーブルの最初のタグ付け結果とhuman_annotationsを
+    比較するが、/corpus/{id}/retagの結果はturnsを上書きせずaddin_resultsに
+    別バージョンとして保存される。そのため、プロンプト改善(chain-of-thought等)
+    を試した後の結果を人手ラベルと比較するには、この関数でaddin_resultsの
+    指定バージョンを読み込んで比較する必要がある。
+
+    labelは比較結果に付けるラベル（例: "CoT追加後"）。省略時はmethod_versionを使う。
+    """
+    conn = get_connection()
+    retag_row = conn.execute(
+        """SELECT result FROM addin_results
+           WHERE session_id=? AND addin_name='phase_intent_tagging' AND method_version=?""",
+        (session_id, method_version)
+    ).fetchone()
+    human_rows = conn.execute(
+        """SELECT ha.annotator_id, ha.turn_id, ha.phase, ha.intent
+           FROM human_annotations ha
+           JOIN turns t ON t.id = ha.turn_id
+           WHERE t.session_id = ?""",
+        (session_id,)
+    ).fetchall()
+    # addin_resultsのturnsはspeaker/start/end/textのみで保存されており、turn_idを
+    # 含まないため、turnsテーブルの並び順(start昇順)と対応付けて逆引きする。
+    # /retagはturnsを順番通りそのまま再タグ付けするため、件数・順序が一致する前提。
+    original_order = conn.execute(
+        "SELECT id FROM turns WHERE session_id=? ORDER BY start", (session_id,)
+    ).fetchall()
+    conn.close()
+
+    if not retag_row:
+        print(f"method_version={method_version} の再タグ付け結果が見つかりません。"
+              f"先に POST /corpus/{session_id}/retag を実行してください。")
+        return None
+
+    retagged_turns = json.loads(retag_row[0])["turns"]
+    original_ids = [r[0] for r in original_order]
+    if len(original_ids) != len(retagged_turns):
+        print(f"件数が一致しません(turns={len(original_ids)}件, retag結果={len(retagged_turns)}件)。"
+              "turnsが変化した後の再タグ付けの可能性があるため比較できません。")
+        return None
+
+    retag_label = label or method_version
+    raters = {retag_label: {
+        turn_id: (t.get("phase"), t.get("intent"))
+        for turn_id, t in zip(original_ids, retagged_turns)
+    }}
+    for annotator_id, turn_id, phase, intent in human_rows:
+        raters.setdefault(annotator_id, {})[turn_id] = (phase, intent)
+
+    rater_ids = list(raters.keys())
+    pairwise_agreement = []
+    for i in range(len(rater_ids)):
+        for j in range(i + 1, len(rater_ids)):
+            rater_a, rater_b = rater_ids[i], rater_ids[j]
+            for label_index, label_type in [(0, "phase"), (1, "intent")]:
+                shared_turns = [
+                    tid for tid in raters[rater_a]
+                    if tid in raters[rater_b]
+                    and raters[rater_a][tid][label_index] is not None
+                    and raters[rater_b][tid][label_index] is not None
+                ]
+                if not shared_turns:
+                    continue
+                labels_a = [raters[rater_a][t][label_index] for t in shared_turns]
+                labels_b = [raters[rater_b][t][label_index] for t in shared_turns]
+                percent_agreement = sum(1 for x, y in zip(labels_a, labels_b) if x == y) / len(shared_turns)
+                pairwise_agreement.append({
+                    "rater_1": rater_a,
+                    "rater_2": rater_b,
+                    "label_type": label_type,
+                    "n": len(shared_turns),
+                    "percent_agreement": round(percent_agreement, 3),
+                    "cohens_kappa": round(cohens_kappa(labels_a, labels_b), 3)
+                })
+
+    return {"session_id": session_id, "raters": rater_ids, "pairwise_agreement": pairwise_agreement}
+
+
 # Cohen's kappaの目安（Landis & Koch, 1977 の慣用的な解釈）
 _KAPPA_GUIDE = [
     (0.81, "ほぼ完全に一致"),
@@ -456,13 +536,11 @@ def get_retag_consistency(session_id: int, method_version: str):
     }
 
 
-def print_agreement_report(session_id: int):
-    data = get_agreement(session_id)
+def _print_agreement(data):
     if not data["pairwise_agreement"]:
         print("比較できるデータがありません。人手ラベルを登録してから実行してください。")
         return data
 
-    print(f"=== セッション{session_id} フェーズ・意図タグ付け 一致率レポート ===\n")
     for m in data["pairwise_agreement"]:
         print(
             f"[{m['label_type']}] {m['rater_1']} vs {m['rater_2']} "
@@ -470,6 +548,26 @@ def print_agreement_report(session_id: int):
             f"Cohen's kappa={m['cohens_kappa']} ({_kappa_label(m['cohens_kappa'])})"
         )
     return data
+
+
+def print_agreement_report(session_id: int):
+    data = get_agreement(session_id)
+    print(f"=== セッション{session_id} フェーズ・意図タグ付け 一致率レポート ===\n")
+    return _print_agreement(data)
+
+
+def print_retag_agreement_report(session_id: int, method_version: str, label: str = None):
+    """
+    print_agreement_report()のretag版。/corpus/{id}/retagの結果
+    （addin_resultsに保存された指定method_version）と人手ラベルの一致率を表示する。
+    プロンプト改善(chain-of-thought等)の前後で、同じ人手ラベルに対する
+    一致率がどう変わったかを比較するために使う。
+    """
+    data = get_agreement_for_retag(session_id, method_version, label)
+    if data is None:
+        return None
+    print(f"=== セッション{session_id} フェーズ・意図タグ付け 一致率レポート（{label or method_version}） ===\n")
+    return _print_agreement(data)
 
 
 # --- 使い方の例（実行する場合はコメントを外す） ---
@@ -519,4 +617,20 @@ def print_agreement_report(session_id: int):
 #    （人手ラベルは一切不要。ただし「正解と合っているか」ではなく
 #    「GPT-4oが毎回同じ判断をするか」を測るものである点に注意）
 # get_retag_consistency(session_id=_latest_session_id, method_version="（5.で控えたmethod_version）")
+
+# --- プロンプト改善(chain-of-thought等)の効果をアブレーションで測る ---
+#
+# 7. audio_analysis_pipeline.pyにプロンプト改善を入れた状態で、retagを実行する
+#    （ngrok_urlはColabに表示されている公開URL。method_versionは分かりやすい名前を付けてよい）
+# import requests
+# retag_res = requests.post(
+#     f"{ngrok_url}/corpus/{_latest_session_id}/retag",
+#     json={"method_version": "cot_v1"}
+# ).json()
+# print(retag_res)
+
+# 8. 改善前(turnsテーブルの元のタグ付け、n=68で測定済み)と、
+#    改善後(retag結果)のそれぞれについて、同じ人手ラベルとの一致率を比較する
+# print_agreement_report(session_id=_latest_session_id)  # 改善前
+# print_retag_agreement_report(session_id=_latest_session_id, method_version="cot_v1", label="CoT追加後")  # 改善後
 

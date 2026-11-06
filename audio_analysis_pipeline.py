@@ -244,6 +244,15 @@ def tag_turns_with_gpt(turns, roles_dict, block_size=40):
     新しいタグ付けロジック（プロンプト変更・モデル変更）を適用し直せるように、
     フル解析の中の全編タグ付け部分を独立させたもの。/upload の初回分析と
     /corpus/{id}/retag による再分析の両方から共有される。
+
+    人手ラベル(n=68)との一致率を測定したところ、判断に迷うと"Information
+    Sharing"/"Explanation"に逃げる傾向が確認された(phase Cohen's kappa=0.146、
+    "わずかに一致"未満の水準)。これに対し、ラベルを決める前に短い理由
+    （reasoning）を書かせるchain-of-thought方式を導入した。JSONはキーの
+    出現順に生成されるため、reasoningをphase/intentより先に置くことで、
+    モデルが対立・結論・合意の兆候を実際に検討してからラベルを選ぶよう促す。
+    reasoning自体はturnsテーブルには保存しない(ラベルの質を上げるための
+    踏み台として使うのみ)。
     """
     tagged = [dict(t) for t in turns]
     for i in range(0, len(tagged), block_size):
@@ -279,7 +288,16 @@ CRITICAL RULES:
 Data (utterances {i} to {i + len(block) - 1} of {len(tagged)} total):
 {json.dumps(block, ensure_ascii=False)}
 
-Return JSON with key 'analysis' containing a list of {{"phase": ..., "intent": ...}} for each utterance in order.
+For each utterance, first briefly explain (1 short sentence) what in the content
+points to a specific phase and intent — e.g. is there tension/pushback (Conflict),
+a wrap-up (Conclusion), a yes/agreed (Agreement)? Only after that reasoning,
+commit to the phase and intent labels. Do not default to "Information Sharing" /
+"Explanation" just because you are unsure — use the reasoning step to actively
+check for signs of the other categories first.
+
+Return JSON with key 'analysis' containing a list of
+{{"reasoning": "...", "phase": ..., "intent": ...}}
+for each utterance in order (reasoning must come first in each object).
         """
         tag_res = client.chat.completions.create(
             model="gpt-4o",
