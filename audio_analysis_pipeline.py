@@ -1257,7 +1257,16 @@ try:
 except Exception as e:
     print(f"\n❌ URL取得失敗: {e}")
 
+import asyncio
+
 nest_asyncio.apply()
 config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio")
 server = uvicorn.Server(config)
-await server.serve()
+
+def _run_server():
+    asyncio.run(server.serve())
+
+server_thread = threading.Thread(target=_run_server, daemon=True)
+server_thread.start()
+time.sleep(2)
+print("✅ サーバーをバックグラウンドで起動しました。このセルは完了し、他のセルを実行できます。")
