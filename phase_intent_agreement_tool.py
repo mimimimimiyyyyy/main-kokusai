@@ -74,10 +74,11 @@ def cohens_kappa(labels_a, labels_b):
     return (po - pe) / (1 - pe)
 
 
-def _sample_turns_with_context(session_id, n, seed, min_chars):
+def _sample_turns_with_context(session_id, n, seed, min_chars, exclude_turn_ids=None):
     """
     対象セッションの発話を取得し、min_chars文字未満の短すぎる発話
-    （相槌の断片など、それだけでは意図・フェーズを判断しづらいもの）を
+    （相槌の断片など、それだけでは意図・フェーズを判断しづらいもの）と、
+    exclude_turn_idsに含まれる発話（既にラベル付け済みのものなど）を
     候補から除外したうえでn件をランダムサンプリングする。
     戻り値: (サンプル[(turn_id, speaker, start, text), ...], 全発話の順序付きID,
              turn_id -> (turn_id, speaker, start, text) の辞書)
@@ -97,6 +98,8 @@ def _sample_turns_with_context(session_id, n, seed, min_chars):
     turns_by_id = {t[0]: t for t in all_turns}
 
     candidates = [t for t in all_turns if len(t[3]) >= min_chars]
+    if exclude_turn_ids:
+        candidates = [t for t in candidates if t[0] not in exclude_turn_ids]
     if not candidates:
         return [], ordered_ids, turns_by_id
 
@@ -118,7 +121,7 @@ def _context_window(turn_id, ordered_ids, turns_by_id, context_size):
 
 
 def export_annotation_template(session_id: int, n: int = 30, seed: int = 42, save_dir: str = SAVE_DIR,
-                                min_chars: int = 8, context_size: int = 2):
+                                min_chars: int = 8, context_size: int = 2, annotator_id: str = None):
     """
     対象セッションの発話からn件をランダムサンプリングし、phase/intent列が空の
     CSVテンプレートを保存する。人手ラベル付けを特定の時間帯や話者に偏らせない
@@ -130,13 +133,29 @@ def export_annotation_template(session_id: int, n: int = 30, seed: int = 42, sav
     実際にはブロック単位(前後の発話も含む)で判断しているため、前後
     context_size件ずつの発話をcontext列にまとめて載せ、人手でも同じように
     文脈込みで判断できるようにする（ラベル付けの対象はtext列の発話のみ）。
+
+    annotator_idを指定すると、そのアノテーターが既にラベル付け済みの発話は
+    候補から除外する（サンプル数を段階的に増やしていく際に、同じ発話を
+    何度も見せないようにするため）。
     """
-    sample, ordered_ids, turns_by_id = _sample_turns_with_context(session_id, n, seed, min_chars)
+    exclude_turn_ids = None
+    if annotator_id:
+        conn = get_connection()
+        exclude_turn_ids = {
+            row[0] for row in conn.execute(
+                """SELECT ha.turn_id FROM human_annotations ha JOIN turns t ON t.id = ha.turn_id
+                   WHERE ha.annotator_id=? AND t.session_id=?""",
+                (annotator_id, session_id)
+            ).fetchall()
+        }
+        conn.close()
+
+    sample, ordered_ids, turns_by_id = _sample_turns_with_context(session_id, n, seed, min_chars, exclude_turn_ids)
     if sample is None:
         print(f"session_id={session_id} のturnsが見つかりません。")
         return None
     if not sample:
-        print(f"min_chars={min_chars}文字以上の発話がありません。min_charsを下げてください。")
+        print(f"min_chars={min_chars}文字以上の未ラベルの発話がありません。")
         return None
 
     template_path = f"{save_dir}/session_{session_id}_annotation_template.csv"
@@ -168,7 +187,7 @@ def _prompt_choice(options):
 
 
 def interactive_annotate(session_id: int, n: int = 15, seed: int = 42, annotator_id: str = "me",
-                          min_chars: int = 8, context_size: int = 2):
+                          min_chars: int = 8, context_size: int = 2, skip_already_labeled: bool = True):
     """
     CSV・スプレッドシートを経由せず、Colabのセル内でinput()を使って直接
     人手ラベル付けができる簡易版。発話のテキストを1件ずつ表示し、phase/intent
@@ -181,17 +200,35 @@ def interactive_annotate(session_id: int, n: int = 15, seed: int = 42, annotator
     context_size件ずつの発話も文脈として一緒に表示する（ラベル付けの対象は
     【対象】と表示された発話のみ）。
 
+    skip_already_labeled=True（デフォルト）の場合、annotator_idが既に
+    ラベル付け済みの発話は候補から除外する。これにより、nを大きくしながら
+    同じ関数を繰り返し呼び出すだけで、サンプル数を段階的に増やしていける
+    （例: 最初にn=18で呼び、後からn=50で呼べば、新たに約50件の未ラベル発話
+    だけが対象になる＝合計で約68件まで増える）。
+
     途中でCtrl+C（中断）しても、それまでに答えた分は保存される。
     """
-    sample, ordered_ids, turns_by_id = _sample_turns_with_context(session_id, n, seed, min_chars)
+    exclude_turn_ids = None
+    if skip_already_labeled:
+        conn = get_connection()
+        exclude_turn_ids = {
+            row[0] for row in conn.execute(
+                """SELECT ha.turn_id FROM human_annotations ha JOIN turns t ON t.id = ha.turn_id
+                   WHERE ha.annotator_id=? AND t.session_id=?""",
+                (annotator_id, session_id)
+            ).fetchall()
+        }
+        conn.close()
+
+    sample, ordered_ids, turns_by_id = _sample_turns_with_context(session_id, n, seed, min_chars, exclude_turn_ids)
     if sample is None:
         print(f"session_id={session_id} のturnsが見つかりません。")
         return None
     if not sample:
-        print(f"min_chars={min_chars}文字以上の発話がありません。min_charsを下げてください。")
+        print(f"min_chars={min_chars}文字以上の未ラベルの発話がありません。")
         return None
 
-    print(f"{len(sample)}件の発話にラベルを付けます（{min_chars}文字未満の短い発話は除外済み）。")
+    print(f"{len(sample)}件の発話にラベルを付けます（{min_chars}文字未満の短い発話・既にラベル済みの発話は除外済み）。")
     print("前後の発話も文脈として表示します（ラベル付けの対象は【対象】の行だけです）。")
     print("各質問で番号を入力してEnterを押してください。Ctrl+Cで中断してもそれまでの回答は保存されます。")
 
