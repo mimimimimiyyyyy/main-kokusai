@@ -986,19 +986,22 @@ def api_retag(session_id: int, req: RetagRequest):
         for t in turns
     ]
 
-    retagged = tag_turns_with_gpt(turn_dicts, roles_dict)
-    version = req.method_version or datetime.now().strftime("%Y%m%d%H%M%S")
+    try:
+        retagged = tag_turns_with_gpt(turn_dicts, roles_dict)
+        version = req.method_version or datetime.now().strftime("%Y%m%d%H%M%S")
 
-    conn.execute(
-        "INSERT INTO addin_results (session_id, addin_name, method_version, created, result) VALUES (?,?,?,?,?)",
-        (
-            session_id, "phase_intent_tagging", version,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            json.dumps({"turns": retagged})
+        conn.execute(
+            "INSERT INTO addin_results (session_id, addin_name, method_version, created, result) VALUES (?,?,?,?,?)",
+            (
+                session_id, "phase_intent_tagging", version,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                json.dumps({"turns": retagged})
+            )
         )
-    )
-    conn.commit()
-    return {"status": "saved", "session_id": session_id, "addin_name": "phase_intent_tagging", "method_version": version}
+        conn.commit()
+        return {"status": "saved", "session_id": session_id, "addin_name": "phase_intent_tagging", "method_version": version}
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 @app.post("/corpus/{session_id}/addin")
