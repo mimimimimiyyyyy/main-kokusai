@@ -136,6 +136,12 @@ def init_db():
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         )
     """)
+    # CREATE TABLE IF NOT EXISTSは既存テーブルには影響しないため、
+    # method_version導入より前にaddin_resultsが作られていたDBでは
+    # このカラムが欠けている。不足していれば追加する。
+    _addin_results_cols = {row[1] for row in conn.execute("PRAGMA table_info(addin_results)")}
+    if "method_version" not in _addin_results_cols:
+        conn.execute("ALTER TABLE addin_results ADD COLUMN method_version TEXT")
     # human_annotations: GPT-4oの自動タグ付け（phase/intent）を検証するための人手ラベル。
     # 発話(turn)ごとに、アノテーター単位で1件を保持する（同じturn×同じannotator_idは上書き）。
     # 複数アノテーターの結果と、turns表にあるGPT-4oのラベルを突き合わせて評定者間一致率
