@@ -1253,14 +1253,29 @@ async def api_transcription_accuracy(session_id: int):
 # uvicornはサブプロセスではなく同じColabカーネルのPythonプロセス内でawaitされて
 # いるため、!pkill -f uvicornでは前回のサーバーを止められない。セルを再実行すると
 # 前回のawait server.serve()がポート8000を掴んだまま残り、新しいサーバーのbindが
-# OSError: address already in useで失敗する現象が実際に発生した。前回のserverが
-# グローバルに残っていれば、新しいサーバーを起動する前にgraceful shutdownさせる。
+# OSError: address already in useで失敗する現象が実際に発生した。old_server変数
+# 経由のshould_exit指定では、この修正より前の実行で残ったタスクを拾えないため、
+# イベントループ上の全タスクから走査して確実に止める。
 import asyncio
-try:
-    old_server.should_exit = True
-    await asyncio.sleep(1)
-except NameError:
-    pass
+
+
+async def _shutdown_stale_servers():
+    current = asyncio.current_task()
+    targets = []
+    for task in asyncio.all_tasks():
+        if task is current or task.done():
+            continue
+        coro = task.get_coro()
+        qualname = getattr(coro, "__qualname__", "") if coro else ""
+        if "Server" in qualname and "serve" in qualname:
+            targets.append(task)
+    for task in targets:
+        task.cancel()
+    if targets:
+        await asyncio.gather(*targets, return_exceptions=True)
+        print(f"🔻 残っていた古いサーバーを{len(targets)}個停止しました")
+
+await _shutdown_stale_servers()
 
 !pkill -f ngrok
 import time
@@ -1286,5 +1301,4 @@ except Exception as e:
 nest_asyncio.apply()
 config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio")
 server = uvicorn.Server(config)
-old_server = server  # 次回このセルを再実行したときに、このインスタンスをgraceful shutdownできるよう残しておく
 await server.serve()
