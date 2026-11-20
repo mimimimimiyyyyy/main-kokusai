@@ -16,6 +16,13 @@
 #   3'. import_annotations_from_csv() で、埋めたCSVをhuman_annotationsテーブルに保存する
 #   4'. print_agreement_report() で一致率を表示する
 #
+# プロンプト改善の効果を測る流れ（サーバー/ngrok不要）:
+#   run_standalone_retag() で、audio_analysis_pipeline.pyのサーバーを起動・再起動
+#   せずにこのセルから直接phase/intentの再タグ付けができる（corpus.dbを直接読み書き
+#   するだけなので、ngrokのURLずれやポート競合といったトラブルを回避できる）。
+#   結果はaddin_resultsにmethod_version付きで保存されるので、
+#   get_agreement_for_retag/print_retag_agreement_reportでそのまま比較できる。
+#
 # PHASE_ORDER/INTENT_LABELSとCohen's kappaの計算ロジックは、サーバー側
 # （audio_analysis_pipeline.py）と同じものをここに複製している。ロジックを
 # 変更した場合は両方に反映すること。
@@ -26,6 +33,7 @@ import random
 import sqlite3
 from datetime import datetime
 
+import openai
 from google.colab import userdata
 
 DB_PATH = "/content/drive/MyDrive/corpus.db"
@@ -457,6 +465,139 @@ def get_agreement_for_retag(session_id: int, method_version: str, label: str = N
     return {"session_id": session_id, "raters": rater_ids, "pairwise_agreement": pairwise_agreement}
 
 
+def _ensure_addin_results_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS addin_results (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id     INTEGER,
+            addin_name     TEXT,
+            method_version TEXT,
+            created        TEXT,
+            result         TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        )
+    """)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(addin_results)")}
+    if "method_version" not in cols:
+        conn.execute("ALTER TABLE addin_results ADD COLUMN method_version TEXT")
+
+
+def _normalize_phase(p):
+    p = str(p)
+    return p if p in PHASE_ORDER else 'Information Sharing'
+
+
+def _normalize_intent(i):
+    i = str(i)
+    return i if i in INTENT_LABELS else 'Explanation'
+
+
+def run_standalone_retag(session_id: int, method_version: str, block_size: int = 40):
+    """
+    audio_analysis_pipeline.pyのサーバー(ngrok経由)を一切使わず、このセルから
+    直接corpus.dbを読み書きしてphase/intentの再タグ付けを行う。サーバー起動・
+    ngrokのURLずれ・ポート競合といったColab特有のトラブルを避けるために、
+    /corpus/{id}/retagと同じロジック(tag_turns_with_gptのfew-shot版)を
+    ここに複製した。プロンプトを変更した場合は両方に反映すること。
+
+    結果はturnsテーブルを上書きせず、addin_resultsにmethod_version付きで
+    保存する。既存のget_agreement_for_retag/print_retag_agreement_reportで
+    そのまま比較できる。
+    """
+    conn = get_connection()
+    _ensure_addin_results_table(conn)
+
+    turns = conn.execute(
+        "SELECT speaker, start, end, text FROM turns WHERE session_id=? ORDER BY start",
+        (session_id,)
+    ).fetchall()
+    if not turns:
+        conn.close()
+        print(f"session_id={session_id} の発話が見つかりません。")
+        return None
+
+    tagged = [{"speaker": t[0], "start": t[1], "end": t[2], "text": t[3]} for t in turns]
+    client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
+
+    for i in range(0, len(tagged), block_size):
+        block = tagged[i: i + block_size]
+        tag_prompt = f"""
+You are a dialogue analysis expert. Label each utterance with a phase and intent.
+
+=== PHASE DEFINITIONS AND EXAMPLES ===
+- "Introduction"       : Opening, greetings, topic setting, agenda announcement
+  e.g. "Okay, let's get started. Today we need to finalize the Q3 roadmap and the client proposal."
+- "Information Sharing": Presenting facts, explaining background, reporting status
+  e.g. "The current conversion rate on the landing page is about 3.2%, slightly below our 4% target."
+- "Conflict"           : Disagreement, opposing opinions, challenging someone's idea, tension
+  e.g. "I don't think that's the right approach. We tried something similar last quarter and it didn't work."
+- "Conclusion"         : Summarizing what was discussed, wrapping up a topic
+  e.g. "So to summarize, we're moving forward with option B and the deadline is next Friday."
+- "Agreement"          : Reaching consensus, confirming a shared decision
+  e.g. "Yeah, that works for me. Let's go with that plan."
+
+CRITICAL RULES:
+* A real conversation MUST contain multiple phases. Do NOT assign "Information Sharing" to everything.
+* Early utterances  → likely "Introduction"
+* Middle utterances → "Information Sharing", "Conflict", or "Agreement" depending on content
+* Final utterances  → "Conclusion" or "Agreement"
+* If there is TENSION or OPPOSITION in the exchange -> use "Conflict"
+* A neutral question for clarification is NOT "Conflict"
+* If someone says ok / agreed / let's do that → use "Agreement"
+
+=== INTENT DEFINITIONS AND EXAMPLES ===
+- "Proposal"      : Suggesting a new idea or action
+  e.g. "What if we moved the deadline up by a week to give us more buffer time?"
+- "Question"      : Asking for information or clarification
+  e.g. "How many users have we onboarded so far this month?"
+- "Agreement"     : Expressing approval or consent
+  e.g. "Sounds good, I'm on board with that."
+- "Disagreement"  : Expressing opposition or doubt
+  e.g. "I'm not sure I agree with that assessment, honestly."
+- "Confirmation"  : Verifying or checking understanding
+  e.g. "So just to confirm, we're sending the revised draft by Thursday, right?"
+- "Acknowledge"   : Short responses showing attention (yeah, I see, mm-hmm)
+  e.g. "Yeah, okay, got it."
+- "Explanation"   : Elaborating or clarifying a point
+  e.g. "The reason the numbers dropped is because we changed the pricing tier in August."
+
+Use the examples above only as a guide to each category's judgment criteria —
+do not default to "Information Sharing" / "Explanation" just because you are
+unsure; actively compare the utterance against ALL categories' examples first.
+
+Data (utterances {i} to {i + len(block) - 1} of {len(tagged)} total):
+{json.dumps(block, ensure_ascii=False)}
+
+Return JSON with key 'analysis' containing a list of
+{{"phase": ..., "intent": ...}}
+for each utterance in order.
+        """
+        tag_res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": tag_prompt}],
+            response_format={"type": "json_object"}
+        )
+        tags = json.loads(tag_res.choices[0].message.content).get('analysis', [])
+        for j, tag in enumerate(tags):
+            if i + j < len(tagged):
+                tagged[i + j]["phase"] = _normalize_phase(tag.get('phase', 'Information Sharing'))
+                tagged[i + j]["intent"] = _normalize_intent(tag.get('intent', 'Explanation'))
+        print(f"  タグ付け中... {min(i + block_size, len(tagged))}/{len(tagged)}")
+
+    conn.execute(
+        "INSERT INTO addin_results (session_id, addin_name, method_version, created, result) VALUES (?,?,?,?,?)",
+        (
+            session_id, "phase_intent_tagging", method_version,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            json.dumps({"turns": tagged})
+        )
+    )
+    conn.commit()
+    conn.close()
+    print(f"✅ session_id={session_id} の再タグ付け結果を method_version={method_version} として保存しました")
+    return {"status": "saved", "session_id": session_id, "method_version": method_version}
+
+
 # Cohen's kappaの目安（Landis & Koch, 1977 の慣用的な解釈）
 _KAPPA_GUIDE = [
     (0.81, "ほぼ完全に一致"),
@@ -607,26 +748,20 @@ def print_retag_agreement_report(session_id: int, method_version: str, label: st
 
 # --- 人手を使わない自動チェック: GPT-4oの自己一貫性 ---
 #
-# 5. まずColab外(ブラウザ等)かrequestsで、対象セッションの再タグ付けを実行する
-#    （ngrok_urlはColabに表示されている公開URLに置き換える）
-# import requests
-# retag_res = requests.post(f"{ngrok_url}/corpus/{_latest_session_id}/retag").json()
-# print(retag_res)  # {"status": "saved", ..., "method_version": "..."} のmethod_versionを控える
+# 5. run_standalone_retag()で、サーバー/ngrokを使わずこのセルから直接再タグ付けする
+# retag_res = run_standalone_retag(session_id=_latest_session_id, method_version="consistency_check_1")
+# print(retag_res)
 
 # 6. 1回目のタグ付け結果とretag結果の一致率・Cohen's kappaを表示する
 #    （人手ラベルは一切不要。ただし「正解と合っているか」ではなく
 #    「GPT-4oが毎回同じ判断をするか」を測るものである点に注意）
-# get_retag_consistency(session_id=_latest_session_id, method_version="（5.で控えたmethod_version）")
+# get_retag_consistency(session_id=_latest_session_id, method_version="consistency_check_1")
 
-# --- プロンプト改善(chain-of-thought等)の効果をアブレーションで測る ---
+# --- プロンプト改善(few-shot等)の効果をアブレーションで測る ---
 #
-# 7. audio_analysis_pipeline.pyにプロンプト改善を入れた状態で、retagを実行する
-#    （ngrok_urlはColabに表示されている公開URL。method_versionは分かりやすい名前を付けてよい）
-# import requests
-# retag_res = requests.post(
-#     f"{ngrok_url}/corpus/{_latest_session_id}/retag",
-#     json={"method_version": "fewshot_v1"}
-# ).json()
+# 7. phase_intent_agreement_tool.py内のrun_standalone_retagのプロンプトを変更したら、
+#    サーバー(audio_analysis_pipeline.py)は一切再起動せず、このセルだけ再実行する
+# retag_res = run_standalone_retag(session_id=_latest_session_id, method_version="fewshot_v1")
 # print(retag_res)
 
 # 8. 改善前(turnsテーブルの元のタグ付け、n=68で測定済み)と、
