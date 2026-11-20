@@ -253,12 +253,9 @@ def tag_turns_with_gpt(turns, roles_dict, block_size=40):
 
     人手ラベル(n=68)との一致率を測定したところ、判断に迷うと"Information
     Sharing"/"Explanation"に逃げる傾向が確認された(phase Cohen's kappa=0.146、
-    "わずかに一致"未満の水準)。これに対し、ラベルを決める前に短い理由
-    （reasoning）を書かせるchain-of-thought方式を導入した。JSONはキーの
-    出現順に生成されるため、reasoningをphase/intentより先に置くことで、
-    モデルが対立・結論・合意の兆候を実際に検討してからラベルを選ぶよう促す。
-    reasoning自体はturnsテーブルには保存しない(ラベルの質を上げるための
-    踏み台として使うのみ)。
+    "わずかに一致"未満の水準)。これに対し、各カテゴリの具体例(few-shot)を
+    プロンプトに埋め込み、モデルが「安全な」多数派ラベルに逃げず、各カテゴリの
+    判断基準を具体的な発話例から掴めるようにした。
     """
     tagged = [dict(t) for t in turns]
     for i in range(0, len(tagged), block_size):
@@ -266,12 +263,17 @@ def tag_turns_with_gpt(turns, roles_dict, block_size=40):
         tag_prompt = f"""
 You are a dialogue analysis expert. Label each utterance with a phase and intent.
 
-=== PHASE DEFINITIONS ===
+=== PHASE DEFINITIONS AND EXAMPLES ===
 - "Introduction"       : Opening, greetings, topic setting, agenda announcement
+  e.g. "Okay, let's get started. Today we need to finalize the Q3 roadmap and the client proposal."
 - "Information Sharing": Presenting facts, explaining background, reporting status
+  e.g. "The current conversion rate on the landing page is about 3.2%, slightly below our 4% target."
 - "Conflict"           : Disagreement, opposing opinions, challenging someone's idea, tension
+  e.g. "I don't think that's the right approach. We tried something similar last quarter and it didn't work."
 - "Conclusion"         : Summarizing what was discussed, wrapping up a topic
+  e.g. "So to summarize, we're moving forward with option B and the deadline is next Friday."
 - "Agreement"          : Reaching consensus, confirming a shared decision
+  e.g. "Yeah, that works for me. Let's go with that plan."
 
 CRITICAL RULES:
 * A real conversation MUST contain multiple phases. Do NOT assign "Information Sharing" to everything.
@@ -282,28 +284,32 @@ CRITICAL RULES:
 * A neutral question for clarification is NOT "Conflict"
 * If someone says ok / agreed / let's do that → use "Agreement"
 
-=== INTENT DEFINITIONS ===
+=== INTENT DEFINITIONS AND EXAMPLES ===
 - "Proposal"      : Suggesting a new idea or action
+  e.g. "What if we moved the deadline up by a week to give us more buffer time?"
 - "Question"      : Asking for information or clarification
+  e.g. "How many users have we onboarded so far this month?"
 - "Agreement"     : Expressing approval or consent
+  e.g. "Sounds good, I'm on board with that."
 - "Disagreement"  : Expressing opposition or doubt
+  e.g. "I'm not sure I agree with that assessment, honestly."
 - "Confirmation"  : Verifying or checking understanding
+  e.g. "So just to confirm, we're sending the revised draft by Thursday, right?"
 - "Acknowledge"   : Short responses showing attention (yeah, I see, mm-hmm)
+  e.g. "Yeah, okay, got it."
 - "Explanation"   : Elaborating or clarifying a point
+  e.g. "The reason the numbers dropped is because we changed the pricing tier in August."
+
+Use the examples above only as a guide to each category's judgment criteria —
+do not default to "Information Sharing" / "Explanation" just because you are
+unsure; actively compare the utterance against ALL categories' examples first.
 
 Data (utterances {i} to {i + len(block) - 1} of {len(tagged)} total):
 {json.dumps(block, ensure_ascii=False)}
 
-For each utterance, first briefly explain (1 short sentence) what in the content
-points to a specific phase and intent — e.g. is there tension/pushback (Conflict),
-a wrap-up (Conclusion), a yes/agreed (Agreement)? Only after that reasoning,
-commit to the phase and intent labels. Do not default to "Information Sharing" /
-"Explanation" just because you are unsure — use the reasoning step to actively
-check for signs of the other categories first.
-
 Return JSON with key 'analysis' containing a list of
-{{"reasoning": "...", "phase": ..., "intent": ...}}
-for each utterance in order (reasoning must come first in each object).
+{{"phase": ..., "intent": ...}}
+for each utterance in order.
         """
         tag_res = client.chat.completions.create(
             model="gpt-4o",

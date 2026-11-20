@@ -625,12 +625,12 @@ def print_retag_agreement_report(session_id: int, method_version: str, label: st
 # import requests
 # retag_res = requests.post(
 #     f"{ngrok_url}/corpus/{_latest_session_id}/retag",
-#     json={"method_version": "cot_v1"}
+#     json={"method_version": "fewshot_v1"}
 # ).json()
 # print(retag_res)
 
 # 8. 改善前(turnsテーブルの元のタグ付け、n=68で測定済み)と、
 #    改善後(retag結果)のそれぞれについて、同じ人手ラベルとの一致率を比較する
 # print_agreement_report(session_id=_latest_session_id)  # 改善前
-# print_retag_agreement_report(session_id=_latest_session_id, method_version="cot_v1", label="CoT追加後")  # 改善後
+# print_retag_agreement_report(session_id=_latest_session_id, method_version="fewshot_v1", label="Few-shot追加後")  # 改善後
 
