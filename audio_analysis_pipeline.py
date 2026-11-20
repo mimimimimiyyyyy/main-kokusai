@@ -1250,7 +1250,18 @@ async def api_transcription_accuracy(session_id: int):
 
 
 # --- 5. サーバー起動 ---
-!pkill -f uvicorn
+# uvicornはサブプロセスではなく同じColabカーネルのPythonプロセス内でawaitされて
+# いるため、!pkill -f uvicornでは前回のサーバーを止められない。セルを再実行すると
+# 前回のawait server.serve()がポート8000を掴んだまま残り、新しいサーバーのbindが
+# OSError: address already in useで失敗する現象が実際に発生した。前回のserverが
+# グローバルに残っていれば、新しいサーバーを起動する前にgraceful shutdownさせる。
+import asyncio
+try:
+    old_server.should_exit = True
+    await asyncio.sleep(1)
+except NameError:
+    pass
+
 !pkill -f ngrok
 import time
 time.sleep(2)
@@ -1275,4 +1286,5 @@ except Exception as e:
 nest_asyncio.apply()
 config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio")
 server = uvicorn.Server(config)
+old_server = server  # 次回このセルを再実行したときに、このインスタンスをgraceful shutdownできるよう残しておく
 await server.serve()
