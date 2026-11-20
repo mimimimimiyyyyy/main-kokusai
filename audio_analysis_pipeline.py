@@ -1253,29 +1253,28 @@ async def api_transcription_accuracy(session_id: int):
 # uvicornはサブプロセスではなく同じColabカーネルのPythonプロセス内でawaitされて
 # いるため、!pkill -f uvicornでは前回のサーバーを止められない。セルを再実行すると
 # 前回のawait server.serve()がポート8000を掴んだまま残り、新しいサーバーのbindが
-# OSError: address already in useで失敗する現象が実際に発生した。old_server変数
-# 経由のshould_exit指定では、この修正より前の実行で残ったタスクを拾えないため、
-# イベントループ上の全タスクから走査して確実に止める。
+# OSError: address already in useで失敗する現象が実際に発生した。
+# task.get_coro().__qualname__で「Server.serve」を探す絞り込みは、IPythonが
+# セル全体を包むラッパーコルーチンの名前しか見えず実際には何もヒットしなかった
+# ため、現在実行中のタスク以外は無条件に全部cancelする方式に変更する。
 import asyncio
 
 
 async def _shutdown_stale_servers():
     current = asyncio.current_task()
-    targets = []
-    for task in asyncio.all_tasks():
-        if task is current or task.done():
-            continue
-        coro = task.get_coro()
-        qualname = getattr(coro, "__qualname__", "") if coro else ""
-        if "Server" in qualname and "serve" in qualname:
-            targets.append(task)
+    targets = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+    print(f"🔍 現在のイベントループ上のタスク数(自分以外): {len(targets)}")
     for task in targets:
         task.cancel()
     if targets:
         await asyncio.gather(*targets, return_exceptions=True)
-        print(f"🔻 残っていた古いサーバーを{len(targets)}個停止しました")
+        print(f"🔻 残っていた古いタスクを{len(targets)}個停止しました")
 
 await _shutdown_stale_servers()
+
+import subprocess as _sp
+print("--- ポート8000の使用状況 ---")
+print(_sp.run(["bash", "-c", "ss -ltnp 2>/dev/null | grep 8000 || echo '(該当なし)'"], capture_output=True, text=True).stdout)
 
 !pkill -f ngrok
 import time
