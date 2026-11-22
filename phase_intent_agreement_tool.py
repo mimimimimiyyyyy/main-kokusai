@@ -492,38 +492,34 @@ def _normalize_intent(i):
     return i if i in INTENT_LABELS else 'Explanation'
 
 
-def run_standalone_retag(session_id: int, method_version: str, block_size: int = 40):
-    """
-    audio_analysis_pipeline.pyのサーバー(ngrok経由)を一切使わず、このセルから
-    直接corpus.dbを読み書きしてphase/intentの再タグ付けを行う。サーバー起動・
-    ngrokのURLずれ・ポート競合といったColab特有のトラブルを避けるために、
-    /corpus/{id}/retagと同じロジック(tag_turns_with_gptのfew-shot版)を
-    ここに複製した。プロンプトを変更した場合は両方に反映すること。
+_PHASE_INTENT_DEFS = """
+=== PHASE DEFINITIONS ===
+- "Introduction"       : Opening, greetings, topic setting, agenda announcement
+- "Information Sharing": Presenting facts, explaining background, reporting status
+- "Conflict"           : Disagreement, opposing opinions, challenging someone's idea, tension
+- "Conclusion"         : Summarizing what was discussed, wrapping up a topic
+- "Agreement"          : Reaching consensus, confirming a shared decision
 
-    結果はturnsテーブルを上書きせず、addin_resultsにmethod_version付きで
-    保存する。既存のget_agreement_for_retag/print_retag_agreement_reportで
-    そのまま比較できる。
-    """
-    conn = get_connection()
-    _ensure_addin_results_table(conn)
+CRITICAL RULES:
+* A real conversation MUST contain multiple phases. Do NOT assign "Information Sharing" to everything.
+* Early utterances  → likely "Introduction"
+* Middle utterances → "Information Sharing", "Conflict", or "Agreement" depending on content
+* Final utterances  → "Conclusion" or "Agreement"
+* If there is TENSION or OPPOSITION in the exchange -> use "Conflict"
+* A neutral question for clarification is NOT "Conflict"
+* If someone says ok / agreed / let's do that → use "Agreement"
 
-    turns = conn.execute(
-        "SELECT speaker, start, end, text FROM turns WHERE session_id=? ORDER BY start",
-        (session_id,)
-    ).fetchall()
-    if not turns:
-        conn.close()
-        print(f"session_id={session_id} の発話が見つかりません。")
-        return None
+=== INTENT DEFINITIONS ===
+- "Proposal"      : Suggesting a new idea or action
+- "Question"      : Asking for information or clarification
+- "Agreement"     : Expressing approval or consent
+- "Disagreement"  : Expressing opposition or doubt
+- "Confirmation"  : Verifying or checking understanding
+- "Acknowledge"   : Short responses showing attention (yeah, I see, mm-hmm)
+- "Explanation"   : Elaborating or clarifying a point
+"""
 
-    tagged = [{"speaker": t[0], "start": t[1], "end": t[2], "text": t[3]} for t in turns]
-    client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
-
-    for i in range(0, len(tagged), block_size):
-        block = tagged[i: i + block_size]
-        tag_prompt = f"""
-You are a dialogue analysis expert. Label each utterance with a phase and intent.
-
+_PHASE_INTENT_DEFS_WITH_EXAMPLES = """
 === PHASE DEFINITIONS AND EXAMPLES ===
 - "Introduction"       : Opening, greetings, topic setting, agenda announcement
   e.g. "Okay, let's get started. Today we need to finalize the Q3 roadmap and the client proposal."
@@ -564,14 +560,95 @@ CRITICAL RULES:
 Use the examples above only as a guide to each category's judgment criteria —
 do not default to "Information Sharing" / "Explanation" just because you are
 unsure; actively compare the utterance against ALL categories' examples first.
+"""
 
-Data (utterances {i} to {i + len(block) - 1} of {len(tagged)} total):
+
+def _build_tag_prompt(prompt_variant, i, block, total):
+    """
+    アブレーション用に、プロンプトのバリエーションをここで切り替える。
+    - "baseline": 元のプロンプト(reasoning無し、例文無し)。人手ラベルn=68との
+      比較で、判断に迷うと"Information Sharing"/"Explanation"に逃げる傾向が
+      確認された(phase kappa=0.146)。
+    - "fewshot" : 各カテゴリの具体例をプロンプトに埋め込む方式。試した結果、
+      ベースラインより悪化した(phase kappa=0.01)。プロンプトが長くなった分、
+      ブロック内の一部発話がタグ付けされずに返ってくる(n減少)現象も見られた。
+    - "cot"     : ラベルを決める前に短い理由(reasoning)を書かせる
+      chain-of-thought方式。JSONはキーの出現順に生成されるため、reasoningを
+      phase/intentより先に置くことで、対立・結論・合意の兆候を実際に検討
+      させてからラベルを選ばせる狙い。
+    """
+    if prompt_variant == "cot":
+        return f"""
+You are a dialogue analysis expert. Label each utterance with a phase and intent.
+{_PHASE_INTENT_DEFS}
+Data (utterances {i} to {i + len(block) - 1} of {total} total):
+{json.dumps(block, ensure_ascii=False)}
+
+For each utterance, first briefly explain (1 short sentence) what in the content
+points to a specific phase and intent — e.g. is there tension/pushback (Conflict),
+a wrap-up (Conclusion), a yes/agreed (Agreement)? Only after that reasoning,
+commit to the phase and intent labels. Do not default to "Information Sharing" /
+"Explanation" just because you are unsure — use the reasoning step to actively
+check for signs of the other categories first.
+
+Return JSON with key 'analysis' containing a list of
+{{"reasoning": "...", "phase": ..., "intent": ...}}
+for each utterance in order (reasoning must come first in each object).
+        """
+    if prompt_variant == "fewshot":
+        return f"""
+You are a dialogue analysis expert. Label each utterance with a phase and intent.
+{_PHASE_INTENT_DEFS_WITH_EXAMPLES}
+Data (utterances {i} to {i + len(block) - 1} of {total} total):
 {json.dumps(block, ensure_ascii=False)}
 
 Return JSON with key 'analysis' containing a list of
 {{"phase": ..., "intent": ...}}
 for each utterance in order.
         """
+    # baseline
+    return f"""
+You are a dialogue analysis expert. Label each utterance with a phase and intent.
+{_PHASE_INTENT_DEFS}
+Data (utterances {i} to {i + len(block) - 1} of {total} total):
+{json.dumps(block, ensure_ascii=False)}
+
+Return JSON with key 'analysis' containing a list of {{"phase": ..., "intent": ...}} for each utterance in order.
+        """
+
+
+def run_standalone_retag(session_id: int, method_version: str, prompt_variant: str = "fewshot", block_size: int = 40):
+    """
+    audio_analysis_pipeline.pyのサーバー(ngrok経由)を一切使わず、このセルから
+    直接corpus.dbを読み書きしてphase/intentの再タグ付けを行う。サーバー起動・
+    ngrokのURLずれ・ポート競合といったColab特有のトラブルを避けるために、
+    /corpus/{id}/retagと同じロジックをここに複製した。
+
+    prompt_variantで"baseline"/"fewshot"/"cot"を切り替えられる(_build_tag_prompt参照)。
+    複数の手法を同じ人手ラベルと比較するアブレーション実験のためのもの。
+
+    結果はturnsテーブルを上書きせず、addin_resultsにmethod_version付きで
+    保存する。既存のget_agreement_for_retag/print_retag_agreement_reportで
+    そのまま比較できる。
+    """
+    conn = get_connection()
+    _ensure_addin_results_table(conn)
+
+    turns = conn.execute(
+        "SELECT speaker, start, end, text FROM turns WHERE session_id=? ORDER BY start",
+        (session_id,)
+    ).fetchall()
+    if not turns:
+        conn.close()
+        print(f"session_id={session_id} の発話が見つかりません。")
+        return None
+
+    tagged = [{"speaker": t[0], "start": t[1], "end": t[2], "text": t[3]} for t in turns]
+    client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
+
+    for i in range(0, len(tagged), block_size):
+        block = tagged[i: i + block_size]
+        tag_prompt = _build_tag_prompt(prompt_variant, i, block, len(tagged))
         tag_res = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": tag_prompt}],
@@ -749,7 +826,7 @@ def print_retag_agreement_report(session_id: int, method_version: str, label: st
 # --- 人手を使わない自動チェック: GPT-4oの自己一貫性 ---
 #
 # 5. run_standalone_retag()で、サーバー/ngrokを使わずこのセルから直接再タグ付けする
-# retag_res = run_standalone_retag(session_id=_latest_session_id, method_version="consistency_check_1")
+# retag_res = run_standalone_retag(session_id=_latest_session_id, method_version="consistency_check_1", prompt_variant="baseline")
 # print(retag_res)
 
 # 6. 1回目のタグ付け結果とretag結果の一致率・Cohen's kappaを表示する
@@ -757,15 +834,16 @@ def print_retag_agreement_report(session_id: int, method_version: str, label: st
 #    「GPT-4oが毎回同じ判断をするか」を測るものである点に注意）
 # get_retag_consistency(session_id=_latest_session_id, method_version="consistency_check_1")
 
-# --- プロンプト改善(few-shot等)の効果をアブレーションで測る ---
+# --- プロンプト改善(few-shot/CoT等)の効果をアブレーションで測る ---
 #
-# 7. phase_intent_agreement_tool.py内のrun_standalone_retagのプロンプトを変更したら、
-#    サーバー(audio_analysis_pipeline.py)は一切再起動せず、このセルだけ再実行する
-# retag_res = run_standalone_retag(session_id=_latest_session_id, method_version="fewshot_v1")
-# print(retag_res)
+# 7. prompt_variantで"fewshot"/"cot"/"baseline"を切り替えて再タグ付けする
+#    (サーバーの起動・再起動は一切不要)
+# run_standalone_retag(session_id=_latest_session_id, method_version="fewshot_v1", prompt_variant="fewshot")
+# run_standalone_retag(session_id=_latest_session_id, method_version="cot_v1", prompt_variant="cot")
 
-# 8. 改善前(turnsテーブルの元のタグ付け、n=68で測定済み)と、
-#    改善後(retag結果)のそれぞれについて、同じ人手ラベルとの一致率を比較する
-# print_agreement_report(session_id=_latest_session_id)  # 改善前
-# print_retag_agreement_report(session_id=_latest_session_id, method_version="fewshot_v1", label="Few-shot追加後")  # 改善後
+# 8. ベースライン(turnsテーブルの元のタグ付け、n=68で測定済み)と、
+#    各手法のretag結果について、同じ人手ラベルとの一致率を比較する
+# print_agreement_report(session_id=_latest_session_id)  # ベースライン
+# print_retag_agreement_report(session_id=_latest_session_id, method_version="fewshot_v1", label="Few-shot")
+# print_retag_agreement_report(session_id=_latest_session_id, method_version="cot_v1", label="CoT")
 
