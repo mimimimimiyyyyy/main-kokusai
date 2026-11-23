@@ -510,7 +510,7 @@ _PHASE_INTENT_DEFS = """
 === PHASE DEFINITIONS ===
 - "Introduction"       : Opening, greetings, topic setting, agenda announcement
 - "Information Sharing": Presenting facts, explaining background, reporting status
-- "Conflict"           : Disagreement, opposing opinions, challenging someone's idea, tension
+- "Conflict"           : Disagreement or tension BETWEEN THE SPEAKERS in this conversation
 - "Conclusion"         : Summarizing what was discussed, wrapping up a topic
 - "Agreement"          : Reaching consensus, confirming a shared decision
 
@@ -519,18 +519,28 @@ CRITICAL RULES:
 * Early utterances  → likely "Introduction"
 * Middle utterances → "Information Sharing", "Conflict", or "Agreement" depending on content
 * Final utterances  → "Conclusion" or "Agreement"
-* If there is TENSION or OPPOSITION in the exchange -> use "Conflict"
+* "Conflict" requires one speaker pushing back against, or disagreeing with, ANOTHER
+  SPEAKER'S idea in this conversation. Describing opposing teams, "sides", or the rules
+  of a game/activity (e.g. "we're all on one side, you're all on the other side") is NOT
+  Conflict by itself — that is Information Sharing, unless a speaker is also disagreeing
+  with another speaker about it.
 * A neutral question for clarification is NOT "Conflict"
+* If an utterance OPENS with an agreement marker (yeah, that's true, I agree, sounds
+  good, exactly, right) → classify it as "Agreement", even if the speaker then adds more
+  detail or explanation afterward in the same utterance.
 * If someone says ok / agreed / let's do that → use "Agreement"
 
 === INTENT DEFINITIONS ===
-- "Proposal"      : Suggesting a new idea or action
+- "Proposal"      : Suggesting a new idea or action FOR THE GROUP TO DO
+  (signals: "let's...", "we should...", "what if we...", "how about...")
 - "Question"      : Asking for information or clarification
 - "Agreement"     : Expressing approval or consent
 - "Disagreement"  : Expressing opposition or doubt
 - "Confirmation"  : Verifying or checking understanding
 - "Acknowledge"   : Short responses showing attention (yeah, I see, mm-hmm)
-- "Explanation"   : Elaborating or clarifying a point
+- "Explanation"   : Describing facts, rules, or background WITHOUT suggesting any new
+  action (e.g. explaining how a game works, or adding detail to something already
+  proposed earlier) — if no action is being suggested, prefer "Explanation" over "Proposal"
 """
 
 _PHASE_INTENT_DEFS_WITH_EXAMPLES = """
