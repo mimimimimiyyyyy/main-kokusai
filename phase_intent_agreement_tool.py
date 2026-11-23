@@ -641,7 +641,44 @@ Return JSON with key 'analysis' containing a list of {{"phase": ..., "intent": .
         """
 
 
-def run_standalone_retag(session_id: int, method_version: str, prompt_variant: str = "fewshot", block_size: int = 40):
+def _merge_adjacent_turns(turns, max_gap_sec):
+    """
+    話者分離由来のturnは、同じ話者が短い間を挟んで続けて話しているだけでも
+    別々のturnに分割されてしまう。これが「to 10 people.」のような数語の断片に
+    なり、GPT・人間の双方にとって文脈が読み取りにくい原因になっていた
+    (print_confusion_breakdownの不一致例の多くが断片的な発話だった)。
+
+    タグ付けの判断材料として、同じ話者・短い間隔(max_gap_sec以内)で連続する
+    turnを1つのまとまりに結合してから渡す。結合後のまとまり単位で1つの
+    phase/intentを決め、そのまとまりに含まれる元のturn全部に同じラベルを
+    適用することで、addin_resultsの件数・順序は元のturns件数のまま保つ。
+
+    戻り値: [{"speaker", "start", "end", "text", "member_indices": [...]}, ...]
+    member_indicesは、このグループに含まれる元のturnsリスト内でのインデックス。
+    """
+    groups = []
+    current = None
+    for idx, t in enumerate(turns):
+        if (current is not None
+                and current["speaker"] == t["speaker"]
+                and t["start"] - current["end"] <= max_gap_sec):
+            current["text"] = (current["text"] + " " + t["text"]).strip()
+            current["end"] = t["end"]
+            current["member_indices"].append(idx)
+        else:
+            if current:
+                groups.append(current)
+            current = {
+                "speaker": t["speaker"], "start": t["start"], "end": t["end"],
+                "text": t["text"], "member_indices": [idx]
+            }
+    if current:
+        groups.append(current)
+    return groups
+
+
+def run_standalone_retag(session_id: int, method_version: str, prompt_variant: str = "fewshot",
+                          block_size: int = 40, merge_gap_sec: float = None):
     """
     audio_analysis_pipeline.pyのサーバー(ngrok経由)を一切使わず、このセルから
     直接corpus.dbを読み書きしてphase/intentの再タグ付けを行う。サーバー起動・
@@ -650,6 +687,10 @@ def run_standalone_retag(session_id: int, method_version: str, prompt_variant: s
 
     prompt_variantで"baseline"/"fewshot"/"cot"を切り替えられる(_build_tag_prompt参照)。
     複数の手法を同じ人手ラベルと比較するアブレーション実験のためのもの。
+
+    merge_gap_secを指定すると、_merge_adjacent_turnsで同じ話者の断片的なturnを
+    結合してからタグ付けする(例: 1.5なら1.5秒以内の間隔で続く同話者のturnを結合)。
+    Noneなら結合せず、turnsテーブルの単位のままタグ付けする(従来の挙動)。
 
     結果はturnsテーブルを上書きせず、addin_resultsにmethod_version付きで
     保存する。既存のget_agreement_for_retag/print_retag_agreement_reportで
@@ -667,12 +708,20 @@ def run_standalone_retag(session_id: int, method_version: str, prompt_variant: s
         print(f"session_id={session_id} の発話が見つかりません。")
         return None
 
-    tagged = [{"speaker": t[0], "start": t[1], "end": t[2], "text": t[3]} for t in turns]
+    raw_turns = [{"speaker": t[0], "start": t[1], "end": t[2], "text": t[3]} for t in turns]
+
+    if merge_gap_sec is not None:
+        groups = _merge_adjacent_turns(raw_turns, merge_gap_sec)
+        print(f"  {len(raw_turns)}件のturnを、話者継続・間隔{merge_gap_sec}秒以内で{len(groups)}件にまとめました")
+    else:
+        groups = [{**t, "member_indices": [idx]} for idx, t in enumerate(raw_turns)]
+
+    tagged_groups = [{"speaker": g["speaker"], "start": g["start"], "end": g["end"], "text": g["text"]} for g in groups]
     client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
 
-    for i in range(0, len(tagged), block_size):
-        block = tagged[i: i + block_size]
-        tag_prompt = _build_tag_prompt(prompt_variant, i, block, len(tagged))
+    for i in range(0, len(tagged_groups), block_size):
+        block = tagged_groups[i: i + block_size]
+        tag_prompt = _build_tag_prompt(prompt_variant, i, block, len(tagged_groups))
         tag_res = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": tag_prompt}],
@@ -680,10 +729,17 @@ def run_standalone_retag(session_id: int, method_version: str, prompt_variant: s
         )
         tags = json.loads(tag_res.choices[0].message.content).get('analysis', [])
         for j, tag in enumerate(tags):
-            if i + j < len(tagged):
-                tagged[i + j]["phase"] = _normalize_phase(tag.get('phase', 'Information Sharing'))
-                tagged[i + j]["intent"] = _normalize_intent(tag.get('intent', 'Explanation'))
-        print(f"  タグ付け中... {min(i + block_size, len(tagged))}/{len(tagged)}")
+            if i + j < len(tagged_groups):
+                tagged_groups[i + j]["phase"] = _normalize_phase(tag.get('phase', 'Information Sharing'))
+                tagged_groups[i + j]["intent"] = _normalize_intent(tag.get('intent', 'Explanation'))
+        print(f"  タグ付け中... {min(i + block_size, len(tagged_groups))}/{len(tagged_groups)}")
+
+    # グループ単位のラベルを、元のturns件数・順序のまま展開する
+    tagged = [dict(t) for t in raw_turns]
+    for group, tagged_group in zip(groups, tagged_groups):
+        for idx in group["member_indices"]:
+            tagged[idx]["phase"] = tagged_group.get("phase", "Information Sharing")
+            tagged[idx]["intent"] = tagged_group.get("intent", "Explanation")
 
     conn.execute(
         "INSERT INTO addin_results (session_id, addin_name, method_version, created, result) VALUES (?,?,?,?,?)",
@@ -945,4 +1001,13 @@ def print_confusion_breakdown(session_id: int, method_version: str, label_type: 
 # 9. どのカテゴリがどのカテゴリに誤判定されやすいかを、具体的な発話例付きで表示する
 # print_confusion_breakdown(session_id=_latest_session_id, method_version="cot_block10", label_type="intent")
 # print_confusion_breakdown(session_id=_latest_session_id, method_version="cot_v1", label_type="phase")
+
+# --- 発話の断片化を解消する: 同話者の連続turnを結合してからタグ付け ---
+#
+# 10. merge_gap_secで、同じ話者が短い間隔(秒)以内で続けて話しているturnを
+#     結合してからタグ付けする。数語の断片（例:「to 10 people.」）が
+#     もっと長い・判断しやすい単位になる。
+# run_standalone_retag(session_id=_latest_session_id, method_version="cot_merged_block10",
+#                       prompt_variant="cot", block_size=10, merge_gap_sec=1.5)
+# print_retag_agreement_report(session_id=_latest_session_id, method_version="cot_merged_block10", label="CoT+結合")
 
