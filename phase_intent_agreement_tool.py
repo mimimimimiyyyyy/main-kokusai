@@ -385,6 +385,42 @@ def get_agreement(session_id: int):
     return {"session_id": session_id, "raters": rater_ids, "pairwise_agreement": pairwise_agreement}
 
 
+def _load_retag_labels(session_id: int, method_version: str):
+    """
+    addin_resultsのturnsはspeaker/start/end/textのみで保存されており、turn_idを
+    含まないため、turnsテーブルの並び順(start昇順)と対応付けて逆引きする。
+    /retagはturnsを順番通りそのまま再タグ付けするため、件数・順序が一致する前提。
+    見つからない・件数が合わない場合はNoneを返す(エラーメッセージは表示する)。
+    """
+    conn = get_connection()
+    retag_row = conn.execute(
+        """SELECT result FROM addin_results
+           WHERE session_id=? AND addin_name='phase_intent_tagging' AND method_version=?""",
+        (session_id, method_version)
+    ).fetchone()
+    original_order = conn.execute(
+        "SELECT id FROM turns WHERE session_id=? ORDER BY start", (session_id,)
+    ).fetchall()
+    conn.close()
+
+    if not retag_row:
+        print(f"method_version={method_version} の再タグ付け結果が見つかりません。"
+              f"先に run_standalone_retag(method_version={method_version!r}, ...) を実行してください。")
+        return None
+
+    retagged_turns = json.loads(retag_row[0])["turns"]
+    original_ids = [r[0] for r in original_order]
+    if len(original_ids) != len(retagged_turns):
+        print(f"件数が一致しません(turns={len(original_ids)}件, retag結果={len(retagged_turns)}件)。"
+              "turnsが変化した後の再タグ付けの可能性があるため比較できません。")
+        return None
+
+    return {
+        turn_id: (t.get("phase"), t.get("intent"))
+        for turn_id, t in zip(original_ids, retagged_turns)
+    }
+
+
 def get_agreement_for_retag(session_id: int, method_version: str, label: str = None):
     """
     get_agreement()はturnsテーブルの最初のタグ付け結果とhuman_annotationsを
@@ -395,12 +431,11 @@ def get_agreement_for_retag(session_id: int, method_version: str, label: str = N
 
     labelは比較結果に付けるラベル（例: "CoT追加後"）。省略時はmethod_versionを使う。
     """
+    retagged = _load_retag_labels(session_id, method_version)
+    if retagged is None:
+        return None
+
     conn = get_connection()
-    retag_row = conn.execute(
-        """SELECT result FROM addin_results
-           WHERE session_id=? AND addin_name='phase_intent_tagging' AND method_version=?""",
-        (session_id, method_version)
-    ).fetchone()
     human_rows = conn.execute(
         """SELECT ha.annotator_id, ha.turn_id, ha.phase, ha.intent
            FROM human_annotations ha
@@ -408,31 +443,10 @@ def get_agreement_for_retag(session_id: int, method_version: str, label: str = N
            WHERE t.session_id = ?""",
         (session_id,)
     ).fetchall()
-    # addin_resultsのturnsはspeaker/start/end/textのみで保存されており、turn_idを
-    # 含まないため、turnsテーブルの並び順(start昇順)と対応付けて逆引きする。
-    # /retagはturnsを順番通りそのまま再タグ付けするため、件数・順序が一致する前提。
-    original_order = conn.execute(
-        "SELECT id FROM turns WHERE session_id=? ORDER BY start", (session_id,)
-    ).fetchall()
     conn.close()
 
-    if not retag_row:
-        print(f"method_version={method_version} の再タグ付け結果が見つかりません。"
-              f"先に POST /corpus/{session_id}/retag を実行してください。")
-        return None
-
-    retagged_turns = json.loads(retag_row[0])["turns"]
-    original_ids = [r[0] for r in original_order]
-    if len(original_ids) != len(retagged_turns):
-        print(f"件数が一致しません(turns={len(original_ids)}件, retag結果={len(retagged_turns)}件)。"
-              "turnsが変化した後の再タグ付けの可能性があるため比較できません。")
-        return None
-
     retag_label = label or method_version
-    raters = {retag_label: {
-        turn_id: (t.get("phase"), t.get("intent"))
-        for turn_id, t in zip(original_ids, retagged_turns)
-    }}
+    raters = {retag_label: retagged}
     for annotator_id, turn_id, phase, intent in human_rows:
         raters.setdefault(annotator_id, {})[turn_id] = (phase, intent)
 
@@ -788,6 +802,75 @@ def print_retag_agreement_report(session_id: int, method_version: str, label: st
     return _print_agreement(data)
 
 
+def print_confusion_breakdown(session_id: int, method_version: str, label_type: str,
+                               annotator_id: str = None, top_n: int = 10, example_chars: int = 80):
+    """
+    GPT-4o(retag結果)と人手ラベルの不一致を、(人手ラベル, GPTラベル)の組み合わせ別に
+    集計して表示する。κが低い理由を「とりあえずプロンプトを変える」で探るのではなく、
+    どのカテゴリがどのカテゴリに誤判定されやすいかを具体的に見てから改善の的を絞るために使う。
+
+    label_type: "phase" または "intent"。
+    annotator_idを省略すると、human_annotationsの全アノテーターを対象にする。
+    """
+    if label_type not in ("phase", "intent"):
+        print('label_typeは"phase"か"intent"を指定してください。')
+        return None
+
+    retagged = _load_retag_labels(session_id, method_version)
+    if retagged is None:
+        return None
+
+    conn = get_connection()
+    query = """SELECT ha.annotator_id, ha.turn_id, ha.phase, ha.intent, t.text
+               FROM human_annotations ha
+               JOIN turns t ON t.id = ha.turn_id
+               WHERE t.session_id = ?"""
+    params = [session_id]
+    if annotator_id:
+        query += " AND ha.annotator_id = ?"
+        params.append(annotator_id)
+    human_rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    label_index = 0 if label_type == "phase" else 1
+    mismatch_counts = {}
+    mismatch_examples = {}
+    n_total, n_match = 0, 0
+    for _, turn_id, phase, intent, text in human_rows:
+        human_label = phase if label_type == "phase" else intent
+        if turn_id not in retagged or human_label is None:
+            continue
+        gpt_label = retagged[turn_id][label_index]
+        if gpt_label is None:
+            continue
+        n_total += 1
+        if gpt_label == human_label:
+            n_match += 1
+            continue
+        key = (human_label, gpt_label)
+        mismatch_counts[key] = mismatch_counts.get(key, 0) + 1
+        mismatch_examples.setdefault(key, []).append(text)
+
+    print(f"=== {label_type} 不一致パターン (method_version={method_version}, "
+          f"n={n_total}, 一致={n_match}件, 不一致={n_total - n_match}件) ===\n")
+    ranked = sorted(mismatch_counts.items(), key=lambda kv: -kv[1])[:top_n]
+    for (human_label, gpt_label), count in ranked:
+        print(f"人間「{human_label}」→ GPT「{gpt_label}」: {count}件")
+        for example_text in mismatch_examples[(human_label, gpt_label)][:2]:
+            shown = example_text[:example_chars]
+            print(f"    例: {shown}")
+        print()
+
+    return {
+        "session_id": session_id, "method_version": method_version, "label_type": label_type,
+        "n": n_total, "n_match": n_match,
+        "mismatches": [
+            {"human_label": h, "gpt_label": g, "count": c}
+            for (h, g), c in ranked
+        ]
+    }
+
+
 # --- 使い方の例（実行する場合はコメントを外す） ---
 
 # --- 手軽な流れ(おすすめ・CSV不要) ---
@@ -846,4 +929,10 @@ def print_retag_agreement_report(session_id: int, method_version: str, label: st
 # print_agreement_report(session_id=_latest_session_id)  # ベースライン
 # print_retag_agreement_report(session_id=_latest_session_id, method_version="fewshot_v1", label="Few-shot")
 # print_retag_agreement_report(session_id=_latest_session_id, method_version="cot_v1", label="CoT")
+
+# --- κが低い理由を具体的に見る: 不一致パターンの分析 ---
+#
+# 9. どのカテゴリがどのカテゴリに誤判定されやすいかを、具体的な発話例付きで表示する
+# print_confusion_breakdown(session_id=_latest_session_id, method_version="cot_block10", label_type="intent")
+# print_confusion_breakdown(session_id=_latest_session_id, method_version="cot_v1", label_type="phase")
 
