@@ -587,20 +587,110 @@ unsure; actively compare the utterance against ALL categories' examples first.
 """
 
 
-def _build_tag_prompt(prompt_variant, i, block, total):
+_GENERIC_PHASE_EXAMPLES = {
+    'Introduction': "Okay, let's get started. Today we need to finalize the Q3 roadmap and the client proposal.",
+    'Information Sharing': "The current conversion rate on the landing page is about 3.2%, slightly below our 4% target.",
+    'Conflict': "I don't think that's the right approach. We tried something similar last quarter and it didn't work.",
+    'Conclusion': "So to summarize, we're moving forward with option B and the deadline is next Friday.",
+    'Agreement': "Yeah, that works for me. Let's go with that plan.",
+}
+_GENERIC_INTENT_EXAMPLES = {
+    'Proposal': "What if we moved the deadline up by a week to give us more buffer time?",
+    'Question': "How many users have we onboarded so far this month?",
+    'Agreement': "Sounds good, I'm on board with that.",
+    'Disagreement': "I'm not sure I agree with that assessment, honestly.",
+    'Confirmation': "So just to confirm, we're sending the revised draft by Thursday, right?",
+    'Acknowledge': "Yeah, okay, got it.",
+    'Explanation': "The reason the numbers dropped is because we changed the pricing tier in August.",
+}
+
+
+def _get_indomain_examples(session_id: int):
+    """
+    汎用的な(業務会議風の)few-shot例文が、このセッションの実際の内容
+    (雑談・ゲームの相談など)と噛み合わず精度を下げていた可能性がある
+    (fewshot手法がベースラインより悪化した一因と見られる)。そこで、
+    このセッション自身の人手ラベル済み発話から、カテゴリごとに実例を
+    1件ずつ抽出し、ドメインが一致したfew-shot例文として使う。
+    戻り値: (phase_examples: {label: text}, intent_examples: {label: text})
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT ha.phase, ha.intent, t.text
+           FROM human_annotations ha JOIN turns t ON t.id = ha.turn_id
+           WHERE t.session_id = ?""",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+
+    phase_examples, intent_examples = {}, {}
+    for phase, intent, text in rows:
+        text = (text or "").strip()
+        if len(text) < 15:
+            continue
+        if phase and phase not in phase_examples:
+            phase_examples[phase] = text
+        if intent and intent not in intent_examples:
+            intent_examples[intent] = text
+    return phase_examples, intent_examples
+
+
+def _build_indomain_defs(phase_examples, intent_examples):
+    phase_lines = []
+    for label in PHASE_ORDER:
+        text = phase_examples.get(label) or _GENERIC_PHASE_EXAMPLES.get(label, "")
+        source = "" if label in phase_examples else "(汎用例)"
+        phase_lines.append(f'- "{label}"\n  e.g. "{text}" {source}'.rstrip())
+    intent_lines = []
+    for label in INTENT_LABELS:
+        text = intent_examples.get(label) or _GENERIC_INTENT_EXAMPLES.get(label, "")
+        source = "" if label in intent_examples else "(汎用例)"
+        intent_lines.append(f'- "{label}"\n  e.g. "{text}" {source}'.rstrip())
+    return (
+        "\n=== PHASE EXAMPLES (from THIS conversation where available) ===\n"
+        + "\n".join(phase_lines)
+        + "\n\n=== INTENT EXAMPLES (from THIS conversation where available) ===\n"
+        + "\n".join(intent_lines) + "\n"
+    )
+
+
+def _build_tag_prompt(prompt_variant, i, block, total, examples_block=None):
     """
     アブレーション用に、プロンプトのバリエーションをここで切り替える。
     - "baseline": 元のプロンプト(reasoning無し、例文無し)。人手ラベルn=68との
       比較で、判断に迷うと"Information Sharing"/"Explanation"に逃げる傾向が
       確認された(phase kappa=0.146)。
-    - "fewshot" : 各カテゴリの具体例をプロンプトに埋め込む方式。試した結果、
-      ベースラインより悪化した(phase kappa=0.01)。プロンプトが長くなった分、
-      ブロック内の一部発話がタグ付けされずに返ってくる(n減少)現象も見られた。
+    - "fewshot" : 汎用的な(業務会議風の)具体例をプロンプトに埋め込む方式。
+      試した結果、ベースラインより悪化した(phase kappa=0.01)。このセッションの
+      実際の内容(雑談)と例文のドメインが噛み合っていなかったことが一因と見られる。
     - "cot"     : ラベルを決める前に短い理由(reasoning)を書かせる
       chain-of-thought方式。JSONはキーの出現順に生成されるため、reasoningを
       phase/intentより先に置くことで、対立・結論・合意の兆候を実際に検討
       させてからラベルを選ばせる狙い。
+    - "cot_indomain": cotに加えて、このセッション自身の人手ラベル済み発話から
+      抽出したin-domainのfew-shot例文(examples_block、_get_indomain_examples
+      参照)を埋め込む。fewshotの失敗がドメイン不一致によるものなら、
+      ドメインを一致させることで改善するはずだという仮説の検証。
     """
+    if prompt_variant == "cot_indomain":
+        return f"""
+You are a dialogue analysis expert. Label each utterance with a phase and intent.
+{_PHASE_INTENT_DEFS}
+{examples_block or ""}
+Data (utterances {i} to {i + len(block) - 1} of {total} total):
+{json.dumps(block, ensure_ascii=False)}
+
+For each utterance, first briefly explain (1 short sentence) what in the content
+points to a specific phase and intent — e.g. is there tension/pushback (Conflict),
+a wrap-up (Conclusion), a yes/agreed (Agreement)? Only after that reasoning,
+commit to the phase and intent labels. Do not default to "Information Sharing" /
+"Explanation" just because you are unsure — use the reasoning step to actively
+check for signs of the other categories first.
+
+Return JSON with key 'analysis' containing a list of
+{{"reasoning": "...", "phase": ..., "intent": ...}}
+for each utterance in order (reasoning must come first in each object).
+        """
     if prompt_variant == "cot":
         return f"""
 You are a dialogue analysis expert. Label each utterance with a phase and intent.
@@ -685,8 +775,11 @@ def run_standalone_retag(session_id: int, method_version: str, prompt_variant: s
     ngrokのURLずれ・ポート競合といったColab特有のトラブルを避けるために、
     /corpus/{id}/retagと同じロジックをここに複製した。
 
-    prompt_variantで"baseline"/"fewshot"/"cot"を切り替えられる(_build_tag_prompt参照)。
-    複数の手法を同じ人手ラベルと比較するアブレーション実験のためのもの。
+    prompt_variantで"baseline"/"fewshot"/"cot"/"cot_indomain"を切り替えられる
+    (_build_tag_prompt参照)。複数の手法を同じ人手ラベルと比較するアブレーション
+    実験のためのもの。"cot_indomain"は、このセッション自身の人手ラベル済み発話から
+    few-shot例文を自動抽出するため、_get_indomain_examplesを事前に呼ぶ
+    (人手ラベルがまだ無いとカテゴリによっては汎用例文にフォールバックする)。
 
     merge_gap_secを指定すると、_merge_adjacent_turnsで同じ話者の断片的なturnを
     結合してからタグ付けする(例: 1.5なら1.5秒以内の間隔で続く同話者のturnを結合)。
@@ -719,9 +812,16 @@ def run_standalone_retag(session_id: int, method_version: str, prompt_variant: s
     tagged_groups = [{"speaker": g["speaker"], "start": g["start"], "end": g["end"], "text": g["text"]} for g in groups]
     client = openai.OpenAI(api_key=userdata.get('OPENAI_API_KEY'))
 
+    examples_block = None
+    if prompt_variant == "cot_indomain":
+        phase_examples, intent_examples = _get_indomain_examples(session_id)
+        examples_block = _build_indomain_defs(phase_examples, intent_examples)
+        print(f"  in-domain例文: phase {len(phase_examples)}/{len(PHASE_ORDER)}カテゴリ分, "
+              f"intent {len(intent_examples)}/{len(INTENT_LABELS)}カテゴリ分をこのセッションから抽出")
+
     for i in range(0, len(tagged_groups), block_size):
         block = tagged_groups[i: i + block_size]
-        tag_prompt = _build_tag_prompt(prompt_variant, i, block, len(tagged_groups))
+        tag_prompt = _build_tag_prompt(prompt_variant, i, block, len(tagged_groups), examples_block=examples_block)
         tag_res = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": tag_prompt}],
@@ -1010,4 +1110,12 @@ def print_confusion_breakdown(session_id: int, method_version: str, label_type: 
 # run_standalone_retag(session_id=_latest_session_id, method_version="cot_merged_block10",
 #                       prompt_variant="cot", block_size=10, merge_gap_sec=1.5)
 # print_retag_agreement_report(session_id=_latest_session_id, method_version="cot_merged_block10", label="CoT+結合")
+
+# --- ドメインが一致したfew-shot例文: このセッション自身の人手ラベルから抽出 ---
+#
+# 11. 汎用的な例文(業務会議風)がこのセッション(雑談)と噛み合わず精度を下げていた
+#     可能性があるため、このセッション自身の人手ラベル済み発話を例文として使う
+# run_standalone_retag(session_id=_latest_session_id, method_version="cot_indomain_block10",
+#                       prompt_variant="cot_indomain", block_size=10)
+# print_retag_agreement_report(session_id=_latest_session_id, method_version="cot_indomain_block10", label="CoT+in-domain例文")
 
